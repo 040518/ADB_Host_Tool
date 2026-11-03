@@ -41,6 +41,7 @@
 ### 2.2 从源码运行
 
 ```powershell
+git clone https://github.com/040518/ADB_Host_Tool.git
 cd ADB_Host_Tool
 pip install -r requirements.txt
 python main.py
