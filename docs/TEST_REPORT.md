@@ -107,11 +107,11 @@ RK3568 USB 设备，因此新增的“真实终端 80 行历史/右键粘贴”�
 | 检查项 | 结果 | 说明 |
 | --- | --- | --- |
 | PyInstaller 构建 | **成功** | `Build complete`，无警告级错误 |
-| 产物 | `dist\ADB_Host_Tool.exe` | 54,575,363 字节（52.0 MB），单文件；SHA256 `F8E30FA621429F8600997B9E3078AA67621CC396F9017F7CA1946DB7D84934C3` |
+| 产物 | `dist\ADB_Host_Tool.exe` | 54,575,031 字节（52.0 MB），单文件；SHA256 `4780F29F0F60127528513F368BDD18E3ED25A8BAF63D0F2AD469116760D3FB35` |
 | 无控制台窗口 | **通过** | spec 中 `console=False` |
 | 应用图标 | **通过** | 嵌入 `resources/app.ico`（多尺寸 16~256） |
 | 桌面交付 | **通过** | 旧窗口关闭后已自动替换 `%USERPROFILE%\Desktop\ADB_Host_Tool.exe`；桌面文件 SHA256 与最新构建包一致 |
-| 双击启动（窗口版） | **通过** | 最新构建包 4.8 秒出现窗口，标题 `ADB 上位机  v2.0.0`，Responding=True；稳定运行 8 秒通过 |
+| 双击启动（窗口版） | **通过** | 最新构建包 5.9 秒出现窗口，标题 `ADB 上位机  v2.0.0`，Responding=True；稳定运行 8 秒通过 |
 | Qt 插件/DLL 缺失 | **无** | 未出现 "could not find or load the Qt platform plugin" 等错误 |
 | 主题与图标（打包后） | **通过** | 深色主题、SVG 图标、中文字体均正常（见截图） |
 | 正常关闭/残留进程 | **通过** | 发送标准 `WM_CLOSE` 后程序自行退出，无 `ADB_Host_Tool` 进程残留 |

@@ -34,7 +34,8 @@
 
 ### 2.1 直接运行 EXE（推荐给使用者）
 
-双击桌面上的 **`ADB_Host_Tool.exe`** 即可，无需安装 Python 或 PySide6。
+从 [GitHub Releases 下载 ADB_Host_Tool.exe](https://github.com/040518/ADB_Host_Tool/releases/download/v2.0.0/ADB_Host_Tool.exe)，
+双击即可运行，无需安装 Python 或 PySide6。
 
 > EXE 由 `build_windows.bat` 生成，单文件、无控制台窗口。
 
