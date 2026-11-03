@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+ADB_Host_Tool.spec
+
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+ssh_profiles.json
+
+# Local test evidence that can contain host names, device IDs, or user paths
+shots/
+docs/screenshots/
+docs/HANDOFF_TO_CODEX.md
+*.log
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
