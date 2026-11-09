@@ -10,27 +10,26 @@ import os
 import time
 from typing import List, Optional
 
-from PySide6.QtCore import QObject, Signal, QThread, QTimer
+from PySide6.QtCore import QObject, Qt, Signal, QThread
 
 from core import adb_backend as ab
 from core import ssh_backend
 
 
 class Worker(QThread):
-    """把一个可调用对象放到后台线程执行，结果通过信号回到主线程。"""
-
-    done = Signal(object, object)     # (result, error)
+    """在后台执行任务，在线程结束后交付结果。"""
 
     def __init__(self, fn, parent=None):
         super().__init__(parent)
         self._fn = fn
+        self.result = None
+        self.error = None
 
     def run(self):
         try:
-            res = self._fn()
-            self.done.emit(res, None)
+            self.result = self._fn()
         except Exception as e:  # noqa: BLE001
-            self.done.emit(None, e)
+            self.error = e
 
 
 class AppContext(QObject):
@@ -65,19 +64,21 @@ class AppContext(QObject):
         w = Worker(fn, self)
         self._workers.append(w)
 
-        def _cleanup(res, err):
+        def _finish():
             try:
-                if on_done:
-                    on_done(res, err)
+                if w in self._workers and on_done:
+                    on_done(w.result, w.error)
             finally:
                 if w in self._workers:
                     self._workers.remove(w)
                 w.deleteLater()
+                if busy_text:
+                    self.busy_changed.emit(False, "")
 
-        w.done.connect(_cleanup)
+        # 结果产生时 run() 可能还在执行，此时销毁 QThread 会使 Qt 崩溃。
+        w.finished.connect(_finish, Qt.ConnectionType.QueuedConnection)
         if busy_text:
             self.busy_changed.emit(True, busy_text)
-            w.done.connect(lambda *_: self.busy_changed.emit(False, ""))
         w.start()
         return w
 
@@ -108,13 +109,26 @@ class AppContext(QObject):
     def is_remote(self) -> bool:
         return self.remote is not None
 
+    def resolve_target(self, preference="auto"):
+        """选择实际执行目标；SSH 本身不依赖 ADB。"""
+        has_adb = self.current is not None and self.current.usable
+        if preference == "ssh":
+            return "ssh" if self.remote is not None else None
+        if preference == "adb":
+            return "adb" if has_adb else None
+        return "adb" if has_adb else ("ssh" if self.remote is not None else None)
+
+    def target_identity(self, preference="auto"):
+        kind = self.resolve_target(preference)
+        return (kind, id(self.remote), self.current.serial if kind == "adb" else None)
+
     def connect_remote(self, prof: dict, on_done=None):
         """建立 SSH 远程连接。"""
         def work():
             sess = ssh_backend.RemoteSession(
                 prof.get("host", ""), prof.get("port", 22),
                 prof.get("user", ""), prof.get("password", ""),
-                prof.get("adb", ""))
+                prof.get("adb", ""), keyfile=prof.get("keyfile", ""))
             sess.connect()
             return sess
 
@@ -127,7 +141,12 @@ class AppContext(QObject):
             # 会话类型切换属于上下文状态变化；先清空旧模式的设备选择，
             # 再通知界面并刷新。UI 状态槽可能被重复调用，不能承担此副作用。
             self.current = None
+            previous = self.remote
             self.remote = sess
+            self.devices = []
+            self.adb.serial = None
+            if previous is not None and previous is not sess:
+                previous.close()
             self.remote_cwd = sess.remote_home or "~"
             self.log("已进入 SSH 远程模式: %s，远端 adb=%s" % (sess.describe(), sess.adb_remote))
             self.remote_changed.emit(True)
@@ -140,6 +159,8 @@ class AppContext(QObject):
     def disconnect_remote(self):
         sess = self.remote
         self.current = None
+        self.devices = []
+        self.adb.serial = None
         self.remote = None
         if sess:
             try:

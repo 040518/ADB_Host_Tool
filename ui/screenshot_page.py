@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import os
 import time
+import re
+import uuid
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QPixmap, QTransform
@@ -23,7 +25,7 @@ class CameraStreamWorker(QThread):
     stream_ended = Signal(int, str, int)   # frame_count, message, generation
 
     def __init__(self, remote, start_command, command, cleanup_command,
-                 forward_spec, generation, parent=None):
+                 forward_spec, generation, parent=None, serial=""):
         super().__init__(parent)
         self.remote = remote
         self.start_command = start_command
@@ -31,8 +33,12 @@ class CameraStreamWorker(QThread):
         self.cleanup_command = cleanup_command
         self.forward_spec = forward_spec
         self.generation = generation
+        self.serial = serial
         self._channel = None
         self._control_channel = None
+
+    def _adb(self, args, timeout=10):
+        return self.remote.adb(["-s", self.serial] + args, timeout=timeout)
 
     def stop(self):
         self.requestInterruption()
@@ -55,19 +61,20 @@ class CameraStreamWorker(QThread):
         channel = None
         control = None
         try:
-            self.remote.adb(["forward", "--remove", self.forward_spec], timeout=10)
-            rc, output = self.remote.adb(
-                ["forward", self.forward_spec, self.forward_spec], timeout=10)
-            if rc != 0:
-                raise RuntimeError("ADB 端口转发失败: %s" % output.strip())
+            if self.forward_spec:
+                self._adb(["forward", "--remove", self.forward_spec])
+                rc, output = self._adb(["forward", self.forward_spec, self.forward_spec])
+                if rc != 0:
+                    raise RuntimeError("ADB 端口转发失败: %s" % output.strip())
             transport = self.remote.client.get_transport()
             if transport is None or not transport.is_active():
                 raise RuntimeError("SSH 连接不可用")
-            control = transport.open_session(timeout=10)
-            self._control_channel = control
-            control.exec_command(self.start_command)
-            self.msleep(350)
-            if control.exit_status_ready():
+            if self.start_command:
+                control = transport.open_session(timeout=10)
+                self._control_channel = control
+                control.exec_command(self.start_command)
+                self.msleep(350)
+            if control is not None and control.exit_status_ready():
                 errors = bytearray()
                 while control.recv_stderr_ready() and len(errors) < 4096:
                     errors.extend(control.recv_stderr(4096))
@@ -103,7 +110,11 @@ class CameraStreamWorker(QThread):
                         data.clear()
                         message = "MJPEG 缓冲区异常，已重置"
                     continue
-                if channel.exit_status_ready():
+                # BusyBox setsid 可能先退出父进程，实际采集子进程仍持有 stdout。
+                # 必须等输出 EOF，不能把父进程状态当成视频结束。
+                if channel.exit_status_ready() and (
+                        getattr(channel, "eof_received", True) or
+                        getattr(channel, "closed", False)):
                     break
                 self.msleep(5)
 
@@ -140,11 +151,16 @@ class CameraStreamWorker(QThread):
                 except Exception:  # noqa: BLE001
                     pass
             try:
-                self.remote.adb(["shell", self.cleanup_command], timeout=10)
+                if self.forward_spec:
+                    self._adb(["shell", self.cleanup_command])
+                else:
+                    cleanup = getattr(self.remote, "exec_independent", self.remote.exec)
+                    cleanup(self.cleanup_command, timeout=10)
             except Exception:  # noqa: BLE001
                 pass
             try:
-                self.remote.adb(["forward", "--remove", self.forward_spec], timeout=10)
+                if self.forward_spec:
+                    self._adb(["forward", "--remove", self.forward_spec])
             except Exception:  # noqa: BLE001
                 pass
             self._channel = None
@@ -164,6 +180,7 @@ class ScreenshotPage(QWidget):
         self._preview_generation = 0
         self._frame_times = []
         self._stream_worker = None
+        self._owned_stream_workers = set()
 
         self._preview_timer = QTimer(self)
         self._preview_timer.setInterval(60)
@@ -175,6 +192,11 @@ class ScreenshotPage(QWidget):
 
         bar = QHBoxLayout()
         bar.setSpacing(6)
+        self.cmb_target = QComboBox()
+        self.cmb_target.addItem("自动（ADB 优先，否则 SSH）", "auto")
+        self.cmb_target.addItem("SSH 目标", "ssh")
+        self.cmb_target.addItem("ADB 设备", "adb")
+        self.cmb_target.setMaximumWidth(220)
 
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems(["设备截图", "实时摄像头"])
@@ -184,6 +206,7 @@ class ScreenshotPage(QWidget):
 
         self.cmb_camera = QComboBox()
         self.cmb_camera.addItems(["/dev/video0", "/dev/video1"])
+        self.cmb_camera.setEditable(True)
         self.cmb_camera.setToolTip("RKISP mainpath / selfpath")
         self.cmb_camera.setVisible(False)
         bar.addWidget(self.cmb_camera)
@@ -237,6 +260,14 @@ class ScreenshotPage(QWidget):
 
         ctx.device_selected.connect(lambda _d: self._device_state_changed())
         ctx.remote_changed.connect(lambda _x: self._device_state_changed(stop=True))
+        self.cmb_target.currentIndexChanged.connect(lambda: self._device_state_changed())
+        self._target_identity = None
+        self.lbl_target = QLabel()
+        target_bar = QHBoxLayout()
+        target_bar.addWidget(self.cmb_target)
+        target_bar.addWidget(self.lbl_target, 1)
+        lay.insertLayout(1, target_bar)
+        self._device_state_changed()
         self._update_controls()
 
     def capture(self):
@@ -326,21 +357,47 @@ class ScreenshotPage(QWidget):
         self._update_controls()
 
     def _device_state_changed(self, stop=False):
-        if stop or self.ctx.current is None:
+        identity = self.ctx.target_identity(self.cmb_target.currentData())
+        if stop or identity != self._target_identity:
             self.stop_preview(update_text=self.cmb_mode.currentIndex() == 1)
+            self._pixmap = None
+            self._camera_source_pixmap = None
+            self.preview.clear()
+            self.preview.setText("目标已切换，点击「开始预览」获取当前目标的画面")
+            key = "camera_rotation_ssh" if identity[0] == "ssh" else "camera_rotation"
+            default = 0 if identity[0] == "ssh" else -90
+            index = self.cmb_rotation.findData(int(self.ctx.settings.get(key, default)))
+            self.cmb_rotation.blockSignals(True)
+            self.cmb_rotation.setCurrentIndex(max(0, index))
+            self.cmb_rotation.blockSignals(False)
+        self._target_identity = identity
+        target = identity[0]
+        if target == "ssh":
+            self.lbl_target.setText("摄像头目标：SSH · %s@%s（无需 ADB）" %
+                                    (self.ctx.remote.user, self.ctx.remote.host))
+            if self.cmb_mode.currentIndex() == 0:
+                self.cmb_mode.setCurrentIndex(1)
+        else:
+            self.lbl_target.setText("摄像头目标：%s" %
+                                    ("ADB · " + self.ctx.current.serial if target else "未连接"))
         self._update_controls()
 
     def _update_controls(self):
-        connected = self.ctx.current is not None
-        self.btn_cap.setEnabled(connected)
+        target = self.ctx.resolve_target(self.cmb_target.currentData())
+        connected = target is not None
         camera = self.cmb_mode.currentIndex() == 1
+        self.btn_cap.setEnabled(connected and (camera or target == "adb") and
+                                (self._preview_active or not self._owned_stream_workers))
         self.cmb_camera.setEnabled(connected and camera and not self._preview_active)
         self.cmb_size.setEnabled(connected and camera and not self._preview_active)
         self.cmb_rotation.setEnabled(connected and camera)
         self.btn_save.setEnabled(self._pixmap is not None)
 
     def start_preview(self):
-        if self.ctx.current is None or self._preview_active:
+        if self.ctx.resolve_target(self.cmb_target.currentData()) is None or self._preview_active:
+            return
+        if not re.fullmatch(r"/dev/video\d+", self.cmb_camera.currentText()):
+            QMessageBox.warning(self, "摄像头节点", "请输入 /dev/video0 这样的摄像头节点")
             return
         self._preview_generation += 1
         self._preview_active = True
@@ -366,7 +423,6 @@ class ScreenshotPage(QWidget):
         self._stream_worker = None
         if worker is not None:
             worker.stop()
-            worker.wait(1500)
         self.btn_cap.setText("开始预览" if self.cmb_mode.currentIndex() == 1
                              else "截取当前画面")
         self.btn_cap.setIcon(theme.load_icon("play" if self.cmb_mode.currentIndex() == 1
@@ -379,6 +435,12 @@ class ScreenshotPage(QWidget):
         node = self.cmb_camera.currentText()
         size = self.cmb_size.currentText().replace("×", "x")
         width, height = [int(x) for x in size.split("x", 1)]
+        if self.ctx.resolve_target(self.cmb_target.currentData()) == "ssh":
+            generic = ("ffmpeg -nostdin -hide_banner -loglevel error -f v4l2 "
+                        "-video_size %dx%d -i %s -frames:v 1 -q:v 5 -f image2pipe pipe:1"
+                        % (width, height, ab.quote(node)))
+            multiplanar = self._nv12_pipeline(node, width, height, single=True)
+            return node, width, height, self._ssh_camera_route(node, multiplanar, generic)
         pipeline = (
             "v4l2-ctl -d %s --set-fmt-video=width=%d,height=%d,pixelformat=NV12 "
             "--stream-mmap=4 --stream-count=1 --stream-to=- 2>/dev/null | "
@@ -392,6 +454,23 @@ class ScreenshotPage(QWidget):
         node = self.cmb_camera.currentText()
         size = self.cmb_size.currentText().replace("×", "x")
         width, height = [int(x) for x in size.split("x", 1)]
+        if self.ctx.resolve_target(self.cmb_target.currentData()) == "ssh":
+            encoded = (
+                "ffmpeg -nostdin -hide_banner -loglevel error -f v4l2 "
+                "-video_size %dx%d -i %s -q:v 7 -f mjpeg pipe:1" %
+                (width, height, ab.quote(node)))
+            native = (
+                "ffmpeg -nostdin -hide_banner -loglevel error -f v4l2 "
+                "-input_format mjpeg -video_size %dx%d -i %s "
+                "-c:v copy -f mjpeg pipe:1" % (width, height, ab.quote(node)))
+            if width <= 640 and height <= 480:
+                generic = encoded
+            else:
+                generic = "(%s) || (%s)" % (native, encoded)
+            # USB 摄像头原生 MJPEG 直接传输，避免在 ARM 主机上解码后再次编码。
+            # 不支持 MJPEG 的 V4L2 设备仍用通用编码路径。
+            multiplanar = self._nv12_pipeline(node, width, height, single=False)
+            return width, height, self._ssh_camera_route(node, multiplanar, generic)
         output = (("-f mjpeg -listen 1 tcp://127.0.0.1:%d" % port)
                   if port else "-f mjpeg pipe:1")
         pipeline = (
@@ -403,6 +482,30 @@ class ScreenshotPage(QWidget):
         ) % (node, width, height, width, height, output)
         return width, height, pipeline
 
+    @staticmethod
+    def _ssh_camera_route(node, multiplanar, generic):
+        """选择目标真实接口；USB 无 v4l2-ctl 时仍可走 FFmpeg 原生采集。"""
+        return ("if v4l2-ctl -d %s --get-fmt-video 2>/dev/null | "
+                "grep -q Multiplanar; then %s; else %s; fi" %
+                (ab.quote(node), multiplanar, generic))
+
+    @staticmethod
+    def _nv12_pipeline(node, width, height, single=False):
+        return (
+            "v4l2-ctl -d %s --set-fmt-video=width=%d,height=%d,pixelformat=NV12 "
+            "--stream-mmap=4 --stream-count=%d --stream-to=- 2>/dev/null | "
+            "ffmpeg -nostdin -hide_banner -loglevel error -f rawvideo -pix_fmt nv12 "
+            "-framerate 30 -video_size %dx%d -i pipe:0 %s-q:v 7 -f mjpeg pipe:1"
+        ) % (ab.quote(node), width, height, 1 if single else 0,
+             width, height, "-frames:v 1 " if single else "")
+
+    @staticmethod
+    def _ssh_session_command(body):
+        quoted = ab.quote(body)
+        return ("if setsid --help 2>&1 | grep -q -- '--wait'; then "
+                "exec setsid -w sh -c %s; else exec setsid sh -c %s; fi" %
+                (quoted, quoted))
+
     def _start_streaming_preview(self):
         """Paramiko 可用时启用长连接；plink/本机模式保留逐帧兼容路径。"""
         remote = self.ctx.remote
@@ -410,15 +513,30 @@ class ScreenshotPage(QWidget):
                 remote.client is None):
             return False
         generation = self._preview_generation
+        target = self.ctx.resolve_target(self.cmb_target.currentData())
+        if target == "ssh":
+            width, height, pipeline = self._camera_stream_pipeline()
+            pidfile = "/tmp/.adbhost_camera_%s.pid" % uuid.uuid4().hex
+            body = "echo $$ > %s; trap 'rm -f %s' EXIT; %s" % (
+                ab.quote(pidfile), ab.quote(pidfile), pipeline)
+            cleanup = ("p=$(cat %s 2>/dev/null); if [ -n \"$p\" ]; then "
+                       "kill -TERM -$p 2>/dev/null || kill -TERM $p 2>/dev/null; fi; rm -f %s"
+                       % (ab.quote(pidfile), ab.quote(pidfile)))
+            # GNU setsid 会在会话首进程场景 fork；-w 保持 SSH channel 存活到采集结束。
+            worker = CameraStreamWorker(remote, "", self._ssh_session_command(body),
+                                        cleanup, None, generation, self)
+            self._attach_stream_worker(worker, width, height)
+            return True
         port = 27180 + (generation % 100)
         width, height, pipeline = self._camera_stream_pipeline(port)
-        pidfile = "/data/local/tmp/.adbhost_camera_%d.pid" % generation
+        pidfile = "/data/local/tmp/.adbhost_camera_%s.pid" % uuid.uuid4().hex
         body = ("echo $$ > %s; trap 'rm -f %s' EXIT; %s" %
                 (ab.quote(pidfile), ab.quote(pidfile), pipeline))
         # 图像走 adb forward 的 TCP 通道，不经过旧 adbd 的 PTY，避免二进制
         # JPEG 中的换行字节被改写。采集进程独立成组，停止时按 PID 精确清理。
         device_command = "setsid sh -c %s" % ab.quote(body)
-        start_command = "%s shell %s" % (ab.quote(remote.adb_remote),
+        start_command = "%s -s %s shell %s" % (ab.quote(remote.adb_remote),
+                                           ab.quote(self.ctx.current.serial),
                                            ab.quote(device_command))
         cleanup_command = (
             "p=$(cat %s 2>/dev/null); "
@@ -429,15 +547,28 @@ class ScreenshotPage(QWidget):
         command = "nc 127.0.0.1 %d" % port
         worker = CameraStreamWorker(remote, start_command, command,
                                     cleanup_command, forward_spec,
-                                    generation, self)
+                                    generation, self, serial=self.ctx.current.serial)
+        self._attach_stream_worker(worker, width, height)
+        return True
+
+    def _attach_stream_worker(self, worker, width, height):
         worker.frame_ready.connect(
             lambda data, gen: self._stream_frame_ready(data, gen, width, height))
         worker.stream_ended.connect(self._stream_ended)
-        worker.finished.connect(worker.deleteLater)
+        self._owned_stream_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self._stream_worker_finished(w))
         self._stream_worker = worker
         self._preview_timer.stop()
         worker.start()
-        return True
+
+    def _stream_worker_finished(self, worker):
+        if worker not in self._owned_stream_workers:
+            return
+        self._owned_stream_workers.remove(worker)
+        if self._stream_worker is worker:
+            self._stream_worker = None
+        worker.deleteLater()
+        self._update_controls()
 
     def _stream_frame_ready(self, data, generation, width, height):
         if not self._preview_active or generation != self._preview_generation:
@@ -470,14 +601,17 @@ class ScreenshotPage(QWidget):
             self._preview_timer.start()
             self._request_camera_frame()
             return
-        self._camera_frame_failed(message or "摄像头数据流已结束")
+        self.stop_preview(update_text=False)
+        self.lbl_info.setText("预览已停止：%s" % (message or "摄像头数据流已结束")[:180])
 
     def _request_camera_frame(self):
-        if not self._preview_active or self._preview_pending or self.ctx.current is None:
+        target = self.ctx.resolve_target(self.cmb_target.currentData())
+        if not self._preview_active or self._preview_pending or target is None:
             return
         self._preview_pending = True
         _node, width, height, pipeline = self._camera_pipeline()
         remote = self.ctx.remote
+        serial = self.ctx.current.serial if target == "adb" else ""
         generation = self._preview_generation
         started = time.monotonic()
 
@@ -490,9 +624,11 @@ class ScreenshotPage(QWidget):
                 ubuntu_jpg = "/tmp/.adbhost_camera_%s.jpg" % stamp
                 try:
                     device_cmd = "timeout 12 sh -c %s" % ab.quote(pipeline)
-                    remote_cmd = "%s shell %s > %s" % (
-                        ab.quote(remote.adb_remote), ab.quote(device_cmd),
-                        ab.quote(ubuntu_jpg))
+                    remote_cmd = ("%s > %s" % (device_cmd, ab.quote(ubuntu_jpg))
+                                  if target == "ssh" else
+                                  "%s -s %s shell %s > %s" % (
+                                      ab.quote(remote.adb_remote), ab.quote(serial),
+                                      ab.quote(device_cmd), ab.quote(ubuntu_jpg)))
                     rc, message = remote.exec(remote_cmd, timeout=15)
                     if rc != 0:
                         return rc, b"", message
@@ -514,16 +650,16 @@ class ScreenshotPage(QWidget):
             capture_cmd = "timeout 12 sh -c %s" % ab.quote(
                 pipeline + " > " + ab.quote(device_jpg))
             try:
-                rc, message = self.ctx.adb.shell(capture_cmd, timeout=15)
+                rc, message = self.ctx.adb.run(["shell", capture_cmd], serial=serial, timeout=15)
                 if rc != 0:
                     return rc, b"", message
-                rc, message = self.ctx.adb.pull(device_jpg, local_jpg, timeout=30)
+                rc, message = self.ctx.adb.run(["pull", device_jpg, local_jpg], serial=serial, timeout=30)
                 if rc != 0 or not os.path.isfile(local_jpg):
                     return rc or 1, b"", message
                 with open(local_jpg, "rb") as f:
                     return 0, f.read(), message
             finally:
-                self.ctx.adb.shell("rm -f %s" % ab.quote(device_jpg), timeout=10)
+                self.ctx.adb.run(["shell", "rm -f %s" % ab.quote(device_jpg)], serial=serial, timeout=10)
                 try:
                     os.remove(local_jpg)
                 except OSError:
@@ -593,7 +729,9 @@ class ScreenshotPage(QWidget):
 
     def _rotation_changed(self, _index):
         degrees = self._rotation_degrees()
-        self.ctx.settings["camera_rotation"] = degrees
+        key = ("camera_rotation_ssh" if self.ctx.resolve_target(self.cmb_target.currentData()) == "ssh"
+               else "camera_rotation")
+        self.ctx.settings[key] = degrees
         theme.save_settings(self.ctx.settings)
         if self.cmb_mode.currentIndex() == 1 and self._camera_source_pixmap is not None:
             self._pixmap = self._orient_camera_pixmap(self._camera_source_pixmap)
@@ -622,6 +760,13 @@ class ScreenshotPage(QWidget):
 
     def shutdown(self):
         self.stop_preview(update_text=False)
+        for worker in list(self._owned_stream_workers):
+            worker.stop()
+            if not worker.wait(12000):
+                worker.remote.close()
+                worker.wait(3000)
+            if not worker.isRunning():
+                self._stream_worker_finished(worker)
 
     def save(self):
         if self._pixmap is None:

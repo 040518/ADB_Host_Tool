@@ -11,17 +11,18 @@ import os
 import queue
 import sys
 import time
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _HERE)
 
-from PySide6.QtCore import QEvent, QPointF, QSize, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QSize, Qt, QThread
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPalette, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from ui import theme
-from ui.context import AppContext
+from ui.context import AppContext, Worker
 from ui.main_window import MainWindow, PAGES
 
 PASS, FAIL, SKIP = [], [], []
@@ -86,7 +87,7 @@ def main():
     icon_dir = os.path.join(theme.resource_dir(), "resources", "icons")
     svgs = [x for x in os.listdir(icon_dir) if x.endswith(".svg")]
     check("图标文件存在", len(svgs) >= 20, "共 %d 个" % len(svgs))
-    need = ["devices", "terminal", "command", "data", "tcp", "files",
+    need = ["devices", "terminal", "command", "data", "wave", "tcp", "files",
             "log", "camera", "settings", "refresh", "plug", "ssh"]
     missing = [n for n in need if not os.path.isfile(os.path.join(icon_dir, n + ".svg"))]
     check("功能页所需图标齐全", not missing, "缺: %s" % missing)
@@ -112,14 +113,19 @@ def main():
     settings = theme.load_settings()
     ctx = AppContext(settings)
     win = MainWindow(ctx)
-    win.resize(1440, 900)
+    screen = app.primaryScreen()
+    work_area = screen.availableGeometry()
+    win.move(work_area.topRight() + QPoint(-500, -60))
+    win.place_on_screen(screen)
     win.show()
     pump(app, 1.2)
 
+    check("启动时窗口边框和标题栏完全位于屏幕工作区",
+          work_area.contains(win.frameGeometry()), repr(win.frameGeometry()))
     check("窗口标题包含产品名", theme.APP_NAME in win.windowTitle(), win.windowTitle())
     check("菜单栏存在", win.menuBar() is not None, "")
     check("工具栏存在", len(win.findChildren(type(win.findChild(type(win.menuBar())))) ) >= 0, "")
-    check("Activity Bar 有 9 个入口", len(win.activity.buttons) == 9,
+    check("Activity Bar 有 10 个入口", len(win.activity.buttons) == 10,
           str(len(win.activity.buttons)))
     check("侧边栏存在", win.sidebar is not None, "")
     check("标签页控件存在", win.tabs is not None, "")
@@ -128,7 +134,8 @@ def main():
     check("状态栏有 5 个信息段",
           all(hasattr(win, n) for n in
               ("sb_state", "sb_devcount", "sb_device", "sb_mode", "sb_remoteinfo")), "")
-    selected_marker = object()
+    from core.adb_backend import DeviceInfo
+    selected_marker = DeviceInfo("TEST_SELECTED", "device")
     ctx.current = selected_marker
     win._on_remote(True)
     win._on_remote(True)
@@ -151,8 +158,8 @@ def main():
             print("     异常: %s" % e)
         check("页面「%s」可打开" % titles[key], ok, "")
 
-    check("9 个页面全部创建", len(win.pages) == 9, str(len(win.pages)))
-    check("标签页数量与页面一致", win.tabs.count() == 9, str(win.tabs.count()))
+    check("10 个页面全部创建", len(win.pages) == 10, str(len(win.pages)))
+    check("标签页数量与页面一致", win.tabs.count() == 10, str(win.tabs.count()))
 
     # 页面切换后 ActivityBar 高亮同步
     win._switch_page("files")
@@ -520,6 +527,59 @@ def main():
     check("HEX 模式解析正确", dp._payload() == b"ABC\r", repr(dp._payload()))
     dp.cmb_mode.setCurrentText("文本")
 
+    # ---- 9a. 串口助手 ----
+    win._switch_page("serial")
+    pump(app, 0.2)
+    serial_page = win.pages["serial"]
+    check("串口页自动收起 ADB 设备侧栏",
+          not win.sidebar.isVisible() and not win.log_panel.isVisible(), "")
+    check("VOFA+ 式协议与连接面板位于左侧",
+          serial_page.control_panel.width() == 245, str(serial_page.control_panel.width()))
+    check("底部可切换数据终端与命令模板",
+          serial_page.bottom_tabs.count() == 2 and
+          [serial_page.bottom_tabs.tabText(i) for i in range(2)] ==
+          ["数据终端", "命令模板"], "")
+    check("串口助手提供三种协议插件",
+          serial_page.cmb_plugin.count() == 3, str(serial_page.cmb_plugin.count()))
+    check("串口参数控件齐全",
+          all(hasattr(serial_page, name) for name in
+              ("cmb_port", "cmb_baud", "cmb_data", "cmb_parity", "cmb_stop", "cmb_flow")), "")
+    serial_page.cmb_plugin.setCurrentIndex(serial_page.cmb_plugin.findData("firewater"))
+    original_channel_colors = dict(serial_page.wave._colors)
+    serial_page.feed_received(b"temp:25.5,hum:60\n1,2,3\n1,2,3,4,5,6,7,8\n")
+    check("文本插件可驱动多通道波形",
+          serial_page.wave.channel_names() ==
+          ["temp", "hum", "CH1", "CH2", "CH3", "CH4", "CH5", "CH6", "CH7", "CH8"] and
+          serial_page.wave._sample_index == 3,
+          repr(serial_page.wave.channel_names()))
+    check("波形同时支持至少 8 个通道",
+          all("CH%d" % i in serial_page.wave.channel_names() for i in range(1, 9)),
+          repr(serial_page.wave.channel_names()))
+    serial_page.wave.set_channel_color("CH8", "#123456")
+    serial_page._sync_channel_list()
+    ch8_items = [serial_page.lst_channels.item(i) for i in range(serial_page.lst_channels.count())
+                 if serial_page.lst_channels.item(i).data(Qt.UserRole) == "CH8"]
+    check("每个通道可独立选择颜色",
+          serial_page.wave.channel_color("CH8") == "#123456" and ch8_items and
+          ch8_items[0].foreground().color().name().upper() == "#123456",
+          serial_page.wave.channel_color("CH8"))
+    serial_page._toggle_wave_focus(True)
+    check("波形可一键放大占满工作区",
+          serial_page.monitor_box.isHidden() and serial_page.lower_splitter.isHidden(), "")
+    serial_page._toggle_wave_focus(False)
+    check("波形放大后可恢复原布局",
+          not serial_page.monitor_box.isHidden() and not serial_page.lower_splitter.isHidden(), "")
+    serial_page.wave._colors = original_channel_colors
+    check("串口接收历史保留原始字节",
+          bytes(serial_page.raw_history).endswith(b"1,2,3,4,5,6,7,8\n"),
+          repr(bytes(serial_page.raw_history)))
+    check("命令模板已加载", serial_page.tbl_commands.rowCount() >= 3,
+          str(serial_page.tbl_commands.rowCount()))
+    serial_page.wave.clear()
+    check("清空波形同时清理通道列表",
+          serial_page.lst_channels.count() == 0 and serial_page.wave._sample_index == 0,
+          str(serial_page.lst_channels.count()))
+
     # ---- 9b. TCP 转发 ----
     tcp = win.pages["tcp"]
     check("reverse 移除使用设备侧端口",
@@ -551,6 +611,8 @@ def main():
     print("\n== 10. 截图 / 摄像头 ==")
     win._switch_page("shot")
     pump(app, 0.3)
+    check("离开串口页后 ADB 设备侧栏恢复",
+          win.sidebar.isVisible() and win.log_panel.isVisible(), "")
     shot = win.pages["shot"]
     check("画面模式可切换", shot.cmb_mode.count() == 2,
           str(shot.cmb_mode.count()))
@@ -616,6 +678,24 @@ def main():
     # ---- 13. 关闭清理 ----
     print("\n== 13. 关闭清理 ==")
     worker_ctx = AppContext(settings)
+    observations = []
+    original_run = Worker.run
+
+    def delayed_return(worker):
+        original_run(worker)
+        # 扩大任务已产生结果、线程还没退出的时间窗口。
+        time.sleep(0.15)
+
+    with patch.object(Worker, "run", delayed_return):
+        worker = worker_ctx.run_async(
+            lambda: 42,
+            lambda res, err: observations.append(
+                (res, err, worker.isFinished(), QThread.currentThread() == app.thread())))
+        pump(app, 0.45)
+    check("后台结果在线程结束后由界面线程处理",
+          observations == [(42, None, True, True)] and not worker_ctx._workers,
+          repr(observations))
+
     worker_ctx.run_async(lambda: time.sleep(8.0))
     pump(app, 0.1)
     stop_started = time.time()

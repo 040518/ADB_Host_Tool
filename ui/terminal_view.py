@@ -78,6 +78,10 @@ class TerminalView(QWidget):
         self._selection_active = None
         self._selection_origin = None
         self._selecting = False
+        self._drag_position = None
+        self._drag_timer = QTimer(self)
+        self._drag_timer.setInterval(60)
+        self._drag_timer.timeout.connect(self._drag_autoscroll)
         self._cursor_on = True
         self._blink = QTimer(self)
         self._blink.setInterval(530)
@@ -192,7 +196,8 @@ class TerminalView(QWidget):
             self._scrollbar.blockSignals(True)
             self._scrollbar.setValue(actual)
             self._scrollbar.blockSignals(False)
-        self.clear_selection()
+        if self._selecting and self._drag_position is not None:
+            self._extend_selection(self._cell_index(self._drag_position))
         self.update()
 
     def _return_to_live(self):
@@ -273,15 +278,26 @@ class TerminalView(QWidget):
                                            base_y + self._ascent), chs)
 
         # 光标：行号必须落在实际渲染的行范围内，否则会画到文字下方一行
-        if self._cursor_on and self.hasFocus() and sess.alive:
-            try:
-                cx, cy = sess.screen.cursor.x, sess.screen.cursor.y
-            except Exception:  # noqa: BLE001
-                cx = cy = 0
-            cy = int(cy)
-            cx = int(cx)
-            if 0 <= cy < min(rows, len(lines)) and 0 <= cx < cols:
-                p.fillRect(QRectF(cx * cw, cy * ch, cw, ch), CURSOR_COLOR)
+        cursor = self._visible_cursor()
+        if self._cursor_on and self.hasFocus() and sess.alive and cursor is not None:
+            cx, cy = cursor
+            p.fillRect(QRectF(cx * cw, cy * ch, cw, ch), CURSOR_COLOR)
+
+    def _visible_cursor(self):
+        # HistoryScreen 移动 buffer 时并不移动 cursor.y；实际输入行位于
+        # 当前视口下方 len(history.bottom) 行，超出视口时不绘制光标。
+        screen = getattr(self.session, "screen", None)
+        if screen is None:
+            return None
+        history = getattr(screen, "history", None)
+        shift = len(history.bottom) if history is not None else 0
+        cx, cy = int(screen.cursor.x), int(screen.cursor.y) + shift
+        rows, cols = self._grid
+        if not shift and getattr(screen.cursor, "hidden", False):
+            return None
+        if 0 <= cy < rows and 0 <= cx < cols:
+            return cx, cy
+        return None
 
     def _paint_plain(self, p: QPainter):
         """无 pyte 时的降级显示。"""
@@ -310,6 +326,10 @@ class TerminalView(QWidget):
 
     def keyPressEvent(self, e):
         sess = self.session
+        if e.key() == Qt.Key_A and e.modifiers() & Qt.ControlModifier:
+            self.select_all()
+            e.accept()
+            return
         if sess is None or not getattr(sess, "alive", False):
             super().keyPressEvent(e)
             return
@@ -360,12 +380,28 @@ class TerminalView(QWidget):
         super().keyPressEvent(e)
 
     # ---- 复制粘贴 ------------------------------------------------------
+    def _view_offset(self):
+        screen = getattr(self.session, "screen", None)
+        history = getattr(screen, "history", None)
+        return len(history.top) if history is not None else 0
+
+    def _document_lines(self):
+        """完整历史和可见屏幕，使用原始字符单元以正确处理中文续列。"""
+        sess = self.session
+        screen = getattr(sess, "screen", None)
+        if screen is None:
+            return None
+        history = getattr(screen, "history", None)
+        top = list(history.top) if history is not None else []
+        bottom = list(history.bottom) if history is not None else []
+        return top + [screen.buffer[y] for y in range(screen.lines)] + bottom
+
     def _cell_index(self, pos) -> int:
         rows, cols = self._grid
         rows, cols = max(1, rows), max(1, cols)
         col = max(0, min(cols - 1, int(pos.x() / self._cell_w)))
         row = max(0, min(rows - 1, int(pos.y() / self._cell_h)))
-        return row * cols + col
+        return (row + self._view_offset()) * cols + col
 
     def _selection_range(self):
         if self._selection_anchor is None or self._selection_active is None:
@@ -382,7 +418,7 @@ class TerminalView(QWidget):
         if cols <= 0:
             return None
         start, end = selected
-        row_start = row * cols
+        row_start = (row + self._view_offset()) * cols
         left, right = max(start, row_start), min(end, row_start + cols)
         if right <= left:
             return None
@@ -405,6 +441,8 @@ class TerminalView(QWidget):
         self._selection_active = None
         self._selection_origin = None
         self._selecting = False
+        self._drag_timer.stop()
+        self._drag_position = None
         if changed:
             self.update()
 
@@ -414,26 +452,27 @@ class TerminalView(QWidget):
         if sess is None or selected is None:
             return ""
         lines = sess.snapshot_lines() or []
+        document = self._document_lines()
         _rows, cols = self._grid
         if not lines or cols <= 0:
             return ""
         start, end = selected
         first_row = max(0, start // cols)
-        last_row = min(len(lines) - 1, (end - 1) // cols)
+        last_row = min((len(document) if document is not None else len(lines)) - 1,
+                       (end - 1) // cols)
         parts = []
         screen = getattr(sess, "screen", None)
         for row in range(first_row, last_row + 1):
-            text = lines[row][0]
             left = start % cols if row == first_row else 0
             right = ((end - 1) % cols) + 1 if row == last_row else cols
-            if screen is not None:
+            if document is not None:
                 # 宽字符的第二列在 pyte 中 data==""；复制时跳过这个续列，
                 # 但保留真正的空格单元格，避免得到“中 文”这样的伪空格。
-                cells = screen.buffer[row]
+                cells = document[row]
                 part = "".join((cells[col].data or "")
                                for col in range(left, min(right, cols)))
             else:
-                part = text[left:right]
+                part = lines[row][0][left:right]
             parts.append(part.rstrip())
         return "\n".join(parts).rstrip("\n")
 
@@ -449,6 +488,10 @@ class TerminalView(QWidget):
         lines = sess.snapshot_lines() if sess is not None else []
         lines = lines or []
         _rows, cols = self._grid
+        document = self._document_lines()
+        if document is not None:
+            lines = [("".join((row[x].data or " ") for x in range(cols)).rstrip(), [])
+                     for row in document]
         nonempty = [i for i, (text, _segs) in enumerate(lines) if text]
         if not nonempty or cols <= 0:
             self.clear_selection()
@@ -478,6 +521,8 @@ class TerminalView(QWidget):
             self._selection_anchor = idx
             self._selection_active = idx
             self._selecting = True
+            self._drag_position = e.position()
+            self._drag_timer.start()
             self.update()
             e.accept()
             return
@@ -485,6 +530,7 @@ class TerminalView(QWidget):
 
     def mouseMoveEvent(self, e):
         if self._selecting and e.buttons() & Qt.LeftButton:
+            self._drag_position = e.position()
             idx = self._cell_index(e.position())
             self._extend_selection(idx)
             self.update()
@@ -502,6 +548,8 @@ class TerminalView(QWidget):
                 self._extend_selection(idx)
             self._selection_origin = None
             self._selecting = False
+            self._drag_timer.stop()
+            self._drag_position = None
             self.update()
             e.accept()
             return
@@ -512,7 +560,8 @@ class TerminalView(QWidget):
             lines = self.session.snapshot_lines() or []
             _rows, cols = self._grid
             idx = self._cell_index(e.position())
-            row, col = divmod(idx, max(1, cols))
+            absolute_row, col = divmod(idx, max(1, cols))
+            row = absolute_row - self._view_offset()
             if row < len(lines):
                 text = lines[row][0]
                 if col < len(text) and not text[col].isspace():
@@ -521,8 +570,8 @@ class TerminalView(QWidget):
                         left -= 1
                     while right < len(text) and not text[right].isspace():
                         right += 1
-                    self._selection_anchor = row * cols + left
-                    self._selection_active = row * cols + right
+                    self._selection_anchor = absolute_row * cols + left
+                    self._selection_active = absolute_row * cols + right
                     self._selection_origin = None
                     self._selecting = False
                     self.update()
@@ -550,3 +599,14 @@ class TerminalView(QWidget):
             e.accept()
             return
         super().wheelEvent(e)
+
+    def _drag_autoscroll(self):
+        pos = self._drag_position
+        if not self._selecting or pos is None:
+            self._drag_timer.stop()
+            return
+        direction = -1 if pos.y() < 0 else (1 if pos.y() >= self.height() else 0)
+        if direction:
+            self._scrollbar.setValue(self._scrollbar.value() + direction * 2)
+            self._extend_selection(self._cell_index(pos))
+            self.update()

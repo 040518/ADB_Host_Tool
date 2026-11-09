@@ -31,6 +31,10 @@ import socket
 import subprocess
 import threading
 import time
+import json
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
 
 IS_WINDOWS = os.name == "nt"
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -109,9 +113,7 @@ def config_path():
     return os.path.join(d, "ssh_profiles.json")
 
 
-def load_config():
-    import json
-    p = config_path()
+def _read_config_file(p):
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -123,15 +125,98 @@ def load_config():
         return dict(DEFAULT_PROFILES)
 
 
-def save_config(cfg):
-    import json
+def load_config():
     p = config_path()
+    if os.path.isfile(p):
+        return _read_config_file(p)
+    return dict(DEFAULT_PROFILES)
+
+
+def profile_key(profile):
     try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        port = int(profile.get("port", 22) or 22)
+    except (ValueError, TypeError):
+        port = 22
+    return (str(profile.get("user", profile.get("username", ""))).strip(),
+            str(profile.get("host", "")).strip().lower(), port)
+
+
+_CONFIG_THREAD_LOCK = threading.RLock()
+
+
+@contextmanager
+def _profile_file_lock(path):
+    """Serialize read/merge/write across independent application windows."""
+    with _CONFIG_THREAD_LOCK, open(path + ".lock", "a+b") as lock:
+        if os.path.getsize(path + ".lock") == 0:
+            lock.write(b"0")
+            lock.flush()
+        lock.seek(0)
+        if IS_WINDOWS:
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if IS_WINDOWS:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def save_config(cfg):
+    p = config_path()
+    temporary = p + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with _profile_file_lock(p):
+            latest = _read_config_file(p)
+            incoming = list(cfg.get("profiles") or [])
+            index = min(max(0, int(cfg.get("last", 0))), len(incoming) - 1)
+            selected = profile_key(incoming[index]) if incoming else None
+            changes = [] if cfg.get("selection_only") else (
+                incoming[index:index + 1] if cfg.get("active_only") else incoming)
+            deleted = {tuple(key) for key in cfg.get("deleted_profiles", [])}
+            merged, positions = [], {}
+            for raw in list(latest.get("profiles") or []) + changes:
+                if not isinstance(raw, dict):
+                    continue
+                item = dict(raw)
+                key = profile_key(item)
+                if not key[0] or not key[1] or key in deleted:
+                    continue
+                item["user"] = key[0]
+                if key in positions:
+                    old = merged[positions[key]]
+                    if not item.get("password") and old.get("password"):
+                        item["password"] = old["password"]
+                    merged[positions[key]] = item
+                else:
+                    positions[key] = len(merged)
+                    merged.append(item)
+            result = {"last": next((i for i, item in enumerate(merged)
+                                      if profile_key(item) == selected), 0), "profiles": merged}
+            if os.path.isfile(p):
+                backup = Path(p).parent / ("ssh_profiles.backup-%s-%s.json" %
+                                           (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:8]))
+                shutil.copy2(p, backup)
+                os.chmod(backup, 0o600)
+                for old in sorted(backup.parent.glob("ssh_profiles.backup-*.json"),
+                                  key=lambda f: f.stat().st_mtime, reverse=True)[10:]:
+                    old.unlink()
+            with open(temporary, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, p)
         return True, p
-    except OSError as e:
+    except (OSError, ValueError, TypeError) as e:
         return False, str(e)
+    finally:
+        if os.path.isfile(temporary):
+            os.remove(temporary)
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +261,11 @@ class RemoteSession:
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         kw = dict(port=self.port, username=self.user, timeout=timeout,
                   banner_timeout=timeout, auth_timeout=timeout,
-                  allow_agent=False, look_for_keys=False)
+                  allow_agent=not bool(self.keyfile), look_for_keys=not bool(self.keyfile))
         if self.password:
             kw["password"] = self.password
         if self.keyfile:
             kw["key_filename"] = self.keyfile
-            kw["look_for_keys"] = not self.password
         try:
             c.connect(self.host, **kw)
         except Exception as e:  # noqa: BLE001
@@ -323,6 +407,12 @@ class RemoteSession:
             return rc, out + err
         except Exception as e:  # noqa: BLE001
             return 1, "远端执行失败: %s" % e
+
+    def exec_independent(self, command, timeout=10):
+        """独立控制通道，用于停止自有摄像头进程，避免等待文件传输的命令锁。"""
+        if self.backend == "paramiko":
+            return self._exec_paramiko(command, timeout)
+        return self._exec_plink(command, timeout)
 
     def _exec_plink(self, command, timeout):
         try:
@@ -478,6 +568,8 @@ USB/adb 链路偶发抖动时（典型报错 cannot stat / device offline / clos
 
     def adb_devices(self):
         rc, out = self.adb(["devices", "-l"], timeout=30)
+        if rc != 0:
+            return []
         res = []
         for line in (out or "").splitlines():
             s = line.strip()
@@ -490,7 +582,7 @@ USB/adb 链路偶发抖动时（典型报错 cannot stat / device offline / clos
 
     def adb_version(self):
         rc, out = self.exec('%s version 2>&1' % _shq(self.adb_remote), timeout=20)
-        return (out or "").strip()
+        return (out or "").strip() if rc == 0 else ""
 
     # ---- 远端文件系统 ---------------------------------------------------
     def list_dir(self, path):
@@ -513,7 +605,7 @@ USB/adb 链路偶发抖动时（典型报错 cannot stat / device offline / clos
                'm=$(stat -c %%y "$f" 2>/dev/null | cut -c1-16); '
                'printf "%%s\\t%%s\\t%%s\\t%%s\\n" "$t" "$s" "$m" "$f"; done') % target
         rc, out = self.exec(cmd, timeout=40)
-        if rc != 0 and not (out or "").strip():
+        if rc != 0:
             return False, [], (out or "").strip() or "无法列出目录"
         entries = []
         for line in out.splitlines():
@@ -669,14 +761,13 @@ USB/adb 链路偶发抖动时（典型报错 cannot stat / device offline / clos
             chan.settimeout(0.0)
 
             def write(b):
-                try:
-                    chan.send(b if isinstance(b, bytes) else b.encode())
-                except Exception:  # noqa: BLE001
-                    pass
+                chan.sendall(b if isinstance(b, bytes) else b.encode())
 
             def read():
                 if chan.recv_ready():
                     return chan.recv(65536)
+                if chan.closed or chan.eof_received or chan.exit_status_ready():
+                    raise EOFError("SSH 终端已退出")
                 return b""
 
             def close():

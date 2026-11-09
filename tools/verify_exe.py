@@ -18,6 +18,7 @@ from ctypes import wintypes
 
 user32 = ctypes.windll.user32
 
+APP_TITLE_PREFIXES = ("MUXO+  v", "ADB 上位机  v")
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 
@@ -76,7 +77,7 @@ def find_app_window(name: str = "ADB_Host_Tool"):
         candidates.append(title)
     # 优先返回真正的界面窗口
     for t in candidates:
-        if "上位机" in t:
+        if t.startswith(APP_TITLE_PREFIXES):
             return t
     return candidates[0] if candidates else ""
 
@@ -108,6 +109,7 @@ def main():
         print("用法: python tools/verify_exe.py <exe路径>")
         return 2
     exe = os.path.abspath(sys.argv[1])
+    name = os.path.splitext(os.path.basename(exe))[0]
     if not os.path.isfile(exe):
         print("[FAIL] 文件不存在: %s" % exe)
         return 1
@@ -136,10 +138,10 @@ def main():
             print("  [FAIL] 进程启动后立即退出，返回码 %s" % proc.returncode)
             fails.append("启动即退出")
             break
-        titles = [t for t in [find_app_window()] if t]
+        titles = [t for t in [find_app_window(name)] if t]
         if titles:
             title = titles[0]
-            if "上位机" not in title or "unhandled exception" in title.lower():
+            if not title.startswith(APP_TITLE_PREFIXES):
                 print("  [FAIL] 出现异常窗口: %s  (%.1fs)" % (title, time.time() - t0))
                 fails.append("未出现应用主窗口")
             else:
@@ -171,11 +173,11 @@ def main():
         print("  [PASS] 持续运行稳定")
 
     print("\n正常关闭程序...")
-    sent = request_app_close()
+    sent = request_app_close(name)
     deadline = time.time() + 10.0
-    while time.time() < deadline and process_count() > 0:
+    while time.time() < deadline and process_count(name) > 0:
         time.sleep(0.25)
-    graceful = sent > 0 and process_count() == 0
+    graceful = sent > 0 and process_count(name) == 0
     if graceful:
         print("  [PASS] 已响应 WM_CLOSE 并自行退出")
     else:
@@ -192,11 +194,11 @@ def main():
     except Exception:  # noqa: BLE001
         pass
 
-    left = process_count()
+    left = process_count(name)
     if left > 0:
         print("  [FAIL] 仍有 %d 个残留进程" % left)
         fails.append("残留进程")
-        subprocess.run(["taskkill", "/IM", "ADB_Host_Tool.exe", "/F"], capture_output=True)
+        subprocess.run(["taskkill", "/IM", name + ".exe", "/F"], capture_output=True)
     else:
         print("  [PASS] 无残留进程")
 

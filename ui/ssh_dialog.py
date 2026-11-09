@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QVBoxLayout, QWidget)
@@ -13,12 +15,7 @@ from ui.context import AppContext
 
 
 def _profile_key(profile):
-    try:
-        port = int(profile.get("port", 22) or 22)
-    except (TypeError, ValueError):
-        port = 22
-    return (str(profile.get("user", "")).strip().lower(),
-            str(profile.get("host", "")).strip().lower(), port)
+    return ssh_backend.profile_key(profile)
 
 
 def _merge_profiles(profiles):
@@ -29,6 +26,7 @@ def _merge_profiles(profiles):
         if not isinstance(raw, dict):
             continue
         profile = dict(raw)
+        profile["user"] = profile.get("user", profile.get("username", ""))
         key = _profile_key(profile)
         if not key[0] or not key[1]:
             continue
@@ -76,8 +74,8 @@ class SshDialog(QDialog):
         lay.setContentsMargins(16, 16, 16, 14)
         lay.setSpacing(10)
 
-        head = QLabel("在 Windows 上操作插在 Ubuntu 上的开发板：\n"
-                      "连接后，设备列表、文件管理、终端全部走 Ubuntu 上的 adb。")
+        head = QLabel("连接 Ubuntu 或其他 Linux SSH 目标：\n"
+                      "无需 ADB 即可传文件、打开终端和预览目标摄像头；也可操作目标上连接的 ADB 设备。")
         head.setObjectName("Hint")
         head.setWordWrap(True)
         lay.addWidget(head)
@@ -88,6 +86,9 @@ class SshDialog(QDialog):
         self.cmb_saved = QComboBox()
         self.cmb_saved.setMinimumWidth(340)
         row.addWidget(self.cmb_saved, 1)
+        self.btn_new_profile = QPushButton("新建连接")
+        self.btn_new_profile.clicked.connect(self._new_profile)
+        row.addWidget(self.btn_new_profile)
         lay.addLayout(row)
         self.lbl_saved = QLabel("")
         self.lbl_saved.setObjectName("Hint")
@@ -168,18 +169,39 @@ class SshDialog(QDialog):
             index = self._last_index if select_index is None else int(select_index)
             self.cmb_saved.setCurrentIndex(max(0, min(index, len(self.profiles) - 1)))
         self.cmb_saved.blockSignals(False)
-        self.lbl_saved.setText("共 %d 条历史配置；选中后会自动恢复密码，可直接连接。" %
+        self.lbl_saved.setText("共 %d 条历史配置；已保存的密码自动恢复，新地址会新增记录。" %
                                len(self.profiles))
 
-    def _persist(self, index):
+    def _persist(self, index, deleted=None, write_profile=False):
         self._last_index = max(0, min(int(index), len(self.profiles) - 1)) if self.profiles else 0
-        return ssh_backend.save_config({"last": self._last_index,
-                                        "profiles": self.profiles})
+        cfg = {"last": self._last_index, "profiles": self.profiles,
+               "active_only": True, "selection_only": not write_profile}
+        if deleted is not None:
+            cfg["deleted_profiles"] = [list(deleted)]
+        result = ssh_backend.save_config(cfg)
+        if result[0] and os.path.isfile(result[1]):
+            actual = ssh_backend.load_config()
+            self.profiles = _merge_profiles(actual.get("profiles", []))
+            self._last_index = actual.get("last", 0)
+        return result
 
     def _selection_changed(self, idx):
         self._apply_saved(idx)
         if 0 <= idx < len(self.profiles):
             self._persist(idx)
+            self._reload_combo(self._last_index)
+            self._apply_saved(self._last_index)
+
+    def _new_profile(self):
+        self.cmb_saved.setCurrentIndex(-1)
+        self.ed_name.setText("SSH 目标")
+        self.ed_host.clear()
+        self.ed_port.setText("22")
+        self.ed_user.clear()
+        self.ed_pass.clear()
+        self.ed_adb.clear()
+        self.lbl_msg.clear()
+        self.ed_host.setFocus()
 
     def _apply_saved(self, idx: int):
         if 0 <= idx < len(self.profiles):
@@ -196,6 +218,8 @@ class SshDialog(QDialog):
             port = int(self.ed_port.text().strip() or 22)
         except ValueError:
             raise ValueError("端口必须是数字")
+        if not 1 <= port <= 65535:
+            raise ValueError("端口必须在 1 到 65535 之间")
         p = {
             "name": self.ed_name.text().strip() or "Ubuntu",
             "host": self.ed_host.text().strip(),
@@ -220,8 +244,9 @@ class SshDialog(QDialog):
         except ValueError as e:
             self._msg(str(e))
             return
-        idx = self.cmb_saved.currentIndex()
-        if 0 <= idx < len(self.profiles):
+        idx = next((i for i, item in enumerate(self.profiles)
+                    if _profile_key(item) == _profile_key(p)), -1)
+        if idx >= 0:
             self.profiles[idx] = p
         else:
             self.profiles.append(p)
@@ -229,20 +254,23 @@ class SshDialog(QDialog):
         self.profiles = _merge_profiles(self.profiles)
         idx = next(i for i, item in enumerate(self.profiles)
                    if _profile_key(item) == _profile_key(p))
-        ok, path = self._persist(idx)
-        self._reload_combo(idx)
-        self._apply_saved(idx)
+        ok, path = self._persist(idx, write_profile=True)
+        self._reload_combo(self._last_index)
+        self._apply_saved(self._last_index)
         self._msg("已保存到 %s" % path if ok else "保存失败: %s" % path, ok)
 
     def _delete(self):
         idx = self.cmb_saved.currentIndex()
         if 0 <= idx < len(self.profiles):
+            deleted = _profile_key(self.profiles[idx])
             self.profiles.pop(idx)
             next_index = min(idx, len(self.profiles) - 1)
-            self._persist(next_index)
-            self._reload_combo(next_index)
+            self._persist(next_index, deleted=deleted)
+            self._reload_combo(self._last_index)
             if self.profiles:
-                self._apply_saved(next_index)
+                self._apply_saved(self._last_index)
+            else:
+                self._new_profile()
             self._msg("已删除", ok=True)
 
     def _connect(self):
@@ -262,7 +290,7 @@ class SshDialog(QDialog):
         else:
             self.profiles.append(p)
             idx = len(self.profiles) - 1
-        self._persist(idx)
+        self._persist(idx, write_profile=True)
         self._profile = p
         self.accept()
 

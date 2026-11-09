@@ -29,7 +29,7 @@ datas = [
 
 hiddenimports = [
     "pyte", "paramiko", "PySide6.QtSvg",
-    "PySide6.QtNetwork", "PySide6.QtPrintSupport",
+    "PySide6.QtNetwork", "PySide6.QtPrintSupport", "PySide6.QtSerialPort",
 ]
 
 a = Analysis(

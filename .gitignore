@@ -9,6 +9,7 @@ venv/
 
 # Build outputs
 build/
+build-*/
 dist/
 ADB_Host_Tool.spec
 
@@ -17,11 +18,17 @@ ADB_Host_Tool.spec
 .env.*
 !.env.example
 ssh_profiles.json
+ssh_profiles.backup-*.json
+ssh_profiles.json.lock
+serial_assistant.json
+settings.json
 
 # Local test evidence that can contain host names, device IDs, or user paths
 shots/
 docs/screenshots/
+docs/v2.3.0-preview/
 docs/HANDOFF_TO_CODEX.md
+docs/ENDPOINT_LIVE_TEST.txt
 *.log
 
 # Editors / OS

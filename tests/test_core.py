@@ -17,6 +17,11 @@ sys.path.insert(0, _HERE)
 from core import adb_backend as ab
 from core import ssh_backend
 from core import terminal_backend as tb
+from core import serial_config
+from core.serial_protocols import (FireWaterPlugin, JustFloatPlugin,
+                                   command_placeholders, decode_hex,
+                                   encode_payload, frames_to_rows,
+                                   render_command)
 
 PASS, FAIL, SKIP = [], [], []
 
@@ -210,8 +215,50 @@ def main():
               repr(payload))
         remote_terminal.stop()
 
-    # ---- 8. 真实设备（可选） ----
-    print("\n== 8. 真实设备 ==")
+    # ---- 8. 串口协议与命令 ----
+    print("\n== 8. 串口协议与命令 ==")
+    fire = FireWaterPlugin()
+    fire_rows = frames_to_rows(fire.feed(b"temp:25.5,hum:6") + fire.feed(b"0\r\n1,2,3\n"))
+    check("FireWater 支持分片与命名通道",
+          fire_rows[:1] == [{"temp": 25.5, "hum": 60.0}], repr(fire_rows))
+    check("FireWater 自动生成多通道名",
+          fire_rows[1:] == [{"CH1": 1.0, "CH2": 2.0, "CH3": 3.0}], repr(fire_rows))
+    eight_rows = frames_to_rows(fire.feed(b"1,2,3,4,5,6,7,8\n"))
+    check("FireWater 至少支持 8 个同步通道",
+          len(eight_rows) == 1 and len(eight_rows[0]) == 8 and
+          eight_rows[0]["CH8"] == 8.0, repr(eight_rows))
+    check("FireWater 不把普通日志误当波形",
+          FireWaterPlugin.parse_line("2026-11-04 INFO boot ok") == {}, "")
+
+    import struct
+    just = JustFloatPlugin()
+    packet = struct.pack("<3f", 1.25, -2.5, 3.75) + JustFloatPlugin.TAIL
+    just_rows = frames_to_rows(just.feed(packet[:7]) + just.feed(packet[7:]))
+    check("JustFloat 分片帧解析正确",
+          len(just_rows) == 1 and abs(just_rows[0]["CH2"] + 2.5) < 1e-6,
+          repr(just_rows))
+    check("HEX 发送支持 0x 与分隔符",
+          decode_hex("0x01, 0xA2 FF") == b"\x01\xA2\xFF", "")
+    check("文本发送可追加 CRLF",
+          encode_payload("AT", "文本", "UTF-8", "CRLF (\\r\\n)") == b"AT\r\n", "")
+    check("命令模板占位符顺序去重",
+          command_placeholders("AT+X={x},{y},{x}") == ["x", "y"], "")
+    check("命令模板参数渲染",
+          render_command("AT+SET={channel},{value}",
+                         {"channel": 2, "value": 3.3}) == "AT+SET=2,3.3", "")
+    cfg_path = os.path.join(tempfile.mkdtemp(prefix="serialcfg_"), "serial.json")
+    cfg = serial_config.default_config()
+    cfg["serial"]["baud"] = 921600
+    cfg["channel_colors"] = {"CH1": "#123456", "CH8": "#ABCDEF"}
+    save_ok, _ = serial_config.save_config(cfg, cfg_path)
+    loaded_cfg = serial_config.load_config(cfg_path)
+    check("串口配置可原子保存并恢复",
+          save_ok and loaded_cfg["serial"]["baud"] == 921600 and
+          len(loaded_cfg["commands"]) == len(cfg["commands"]) and
+          loaded_cfg["channel_colors"]["CH8"] == "#ABCDEF", repr(loaded_cfg))
+
+    # ---- 9. 真实设备（可选） ----
+    print("\n== 9. 真实设备 ==")
     if not exe:
         skip("设备相关测试", "没有 adb")
     else:

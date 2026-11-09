@@ -84,6 +84,11 @@ class TerminalPage(QWidget):
             bar.addWidget(button)
 
         bar.addSpacing(8)
+        self.cmb_target = QComboBox()
+        self.cmb_target.addItem("自动（ADB 优先，否则 SSH）", "auto")
+        self.cmb_target.addItem("SSH 目标", "ssh")
+        self.cmb_target.addItem("ADB 设备", "adb")
+        self.cmb_target.setMaximumWidth(210)
         bar.addWidget(QLabel("终端类型"))
         self.cmb_term = QComboBox()
         self.cmb_term.addItems(["xterm-256color", "xterm", "vt100", "linux"])
@@ -99,6 +104,12 @@ class TerminalPage(QWidget):
         self.lbl_state.setStyleSheet("color:%s;" % theme.COLORS["text_dim"])
         bar.addWidget(self.lbl_state)
         lay.addLayout(bar)
+        target_bar = QHBoxLayout()
+        target_bar.addWidget(QLabel("终端目标"))
+        target_bar.addWidget(self.cmb_target)
+        target_bar.addWidget(QLabel("无 ADB 时自动连接 SSH 主机；可手动指定目标"))
+        target_bar.addStretch(1)
+        lay.addLayout(target_bar)
 
         quick = QHBoxLayout()
         quick.setSpacing(4)
@@ -123,7 +134,7 @@ class TerminalPage(QWidget):
         lay.addWidget(self.tabs, 1)
 
         hint = QLabel("每个标签是一条独立持久 shell，可同时运行不同命令。支持 Tab 补全、"
-                      "Ctrl+C、vi/vim、python3；鼠标拖选，Ctrl+Shift+C 复制，"
+                      "Ctrl+C、vi/vim、python3；Ctrl+A 全选历史；鼠标拖选可滚动，Ctrl+Shift+C 复制，"
                       "右键在有选区时复制、无选区时粘贴；滚轮/右侧滚动条可回看历史。")
         hint.setObjectName("Hint")
         lay.addWidget(hint)
@@ -134,6 +145,9 @@ class TerminalPage(QWidget):
             self.ctx.log("未安装 pyte，终端为简化显示模式（vim 等全屏程序显示不完整）", "warn")
 
         ctx.remote_changed.connect(lambda _x: self._on_mode_changed())
+        ctx.device_selected.connect(lambda _x: self._on_target_changed())
+        self.cmb_target.currentIndexChanged.connect(self._on_target_changed)
+        self._target_identity = ctx.target_identity(self.cmb_target.currentData())
 
     # ---- 兼容旧调用：始终指向当前标签 -------------------------------
     @property
@@ -222,9 +236,15 @@ class TerminalPage(QWidget):
         self._update_count()
 
     def _on_mode_changed(self):
+        self._target_identity = self.ctx.target_identity(self.cmb_target.currentData())
         self.disconnect_all(async_stop=True)
         for pane in self.panes():
             self._set_pane_state(pane, "模式已切换，请重新连接")
+
+    def _on_target_changed(self, *_):
+        identity = self.ctx.target_identity(self.cmb_target.currentData())
+        if identity != self._target_identity:
+            self._on_mode_changed()
 
     # ---- 连接 --------------------------------------------------------
     def connect_terminal(self, pane=None):
@@ -234,8 +254,9 @@ class TerminalPage(QWidget):
         if pane.session is not None and getattr(pane.session, "alive", False):
             pane.view.setFocus()
             return
-        if self.ctx.current is None:
-            QMessageBox.warning(self, "提示", "请先选择/连接一个设备")
+        target = self.ctx.resolve_target(self.cmb_target.currentData())
+        if target is None:
+            QMessageBox.warning(self, "提示", "请连接 SSH 目标或选择可用的 ADB 设备")
             return
 
         pane.connecting = True
@@ -253,7 +274,8 @@ class TerminalPage(QWidget):
         def work():
             if remote is not None:
                 sess = tb.RemoteAdbShellSession(
-                    remote, current.serial, rows=grid_rows, cols=grid_cols)
+                    remote, current.serial if target == "adb" else "",
+                    rows=grid_rows, cols=grid_cols)
             else:
                 sess = tb.TerminalSession(
                     adb_exe, current.serial, rows=grid_rows, cols=grid_cols)
@@ -261,11 +283,11 @@ class TerminalPage(QWidget):
             return sess
 
         def done(sess, err):
-            pane.connecting = False
             if pane.closed or generation != pane.generation:
                 if sess is not None:
                     self.ctx.run_async(lambda: sess.stop(), lambda _r, _e: None)
                 return
+            pane.connecting = False
             if err:
                 self._set_pane_state(pane, "连接失败", theme.COLORS["error"])
                 self.ctx.log("终端连接失败: %s" % err, "error")
@@ -274,9 +296,12 @@ class TerminalPage(QWidget):
             pane.session = sess
             pane.view.set_session(sess)
             pane.view.setFocus()
-            mode = "设备终端（经 SSH）" if remote is not None else "设备终端"
+            mode = ("SSH 目标终端 · %s@%s" % (remote.user, remote.host)
+                    if target == "ssh" else
+                    ("设备终端（经 SSH）" if remote is not None else "设备终端"))
             self._set_pane_state(pane, "已连接 · %s" % mode, theme.COLORS["ok"])
-            self.ctx.log("%s 已连接: %s (%s)" % (pane.title, current.serial, mode))
+            self.ctx.log("%s 已连接: %s (%s)" %
+                         (pane.title, current.serial if target == "adb" else remote.host, mode))
             pending = list(pane.pending_commands)
             pane.pending_commands.clear()
             for command in pending:

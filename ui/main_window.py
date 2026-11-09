@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSplitter,
@@ -21,6 +21,7 @@ PAGES = [
     ("terminal", "交互终端", "terminal"),
     ("command",  "命令执行", "command"),
     ("data",     "数据收发", "data"),
+    ("serial",   "串口助手", "wave"),
     ("tcp",      "TCP 通道", "tcp"),
     ("files",    "文件管理", "files"),
     ("logcat",   "Logcat",  "log"),
@@ -189,6 +190,18 @@ class MainWindow(QMainWindow):
         self._auto_timer.timeout.connect(self._auto_refresh)
         self.apply_settings()
 
+    def place_on_screen(self, screen):
+        """在首次显示前，将窗口边框和标题栏一起放入屏幕工作区。"""
+        self.setScreen(screen)
+        self.winId()  # 创建原生窗口以获取该屏幕缩放比例下的边框尺寸。
+        # 留出边距，容纳 Windows 在分数缩放下还原窗口时的边框偏差。
+        work_area = screen.availableGeometry().adjusted(12, 12, -12, -12)
+        content_area = work_area.marginsRemoved(self.windowHandle().frameMargins())
+        self.setMinimumSize(self.minimumSize().boundedTo(content_area.size()))
+        geometry = QRect(QPoint(), self.size().boundedTo(content_area.size()))
+        geometry.moveCenter(content_area.center())
+        self.setGeometry(geometry)
+
     # ------------------------------------------------------------------ 菜单
     def _build_menu(self):
         mb = self.menuBar()
@@ -232,7 +245,7 @@ class MainWindow(QMainWindow):
         logo.setPixmap(theme.load_pixmap("chip", theme.COLORS["accent_light"], 20))
         logo.setContentsMargins(2, 0, 6, 0)
         tb.addWidget(logo)
-        name = QLabel("ADB 上位机")
+        name = QLabel(theme.APP_NAME)
         name.setStyleSheet("font-weight:600;color:#E8E8E8;font-size:13px;")
         tb.addWidget(name)
         tb.addSeparator()
@@ -377,6 +390,7 @@ class MainWindow(QMainWindow):
         from ui.terminal_page import TerminalPage
         from ui.command_page import CommandPage
         from ui.data_page import DataPage
+        from ui.serial_page import SerialPage
         from ui.tcp_page import TcpPage
         from ui.file_page import FilePage
         from ui.logcat_page import LogcatPage
@@ -385,7 +399,7 @@ class MainWindow(QMainWindow):
 
         factories = {
             "device": DevicePage, "terminal": TerminalPage, "command": CommandPage,
-            "data": DataPage, "tcp": TcpPage, "files": FilePage,
+            "data": DataPage, "serial": SerialPage, "tcp": TcpPage, "files": FilePage,
             "logcat": LogcatPage, "shot": ScreenshotPage, "settings": SettingsPage,
         }
         titles = {k: t for k, t, _ in PAGES}
@@ -400,6 +414,7 @@ class MainWindow(QMainWindow):
         self._current_page = key
         self.tabs.setCurrentIndex(self.page_index[key])
         self.activity.set_current(key)
+        self._apply_page_layout(key)
         try:
             self.ctx.settings["last_page"] = self.page_index[key]
         except Exception:  # noqa: BLE001
@@ -410,7 +425,18 @@ class MainWindow(QMainWindow):
             if i == idx:
                 self._current_page = key
                 self.activity.set_current(key)
+                self._apply_page_layout(key)
                 break
+
+    def _apply_page_layout(self, key: str):
+        """串口页本身已有 VOFA+ 式参数侧栏，隐藏 ADB 设备树避免双侧栏挤压波形。"""
+        serial_mode = key == "serial"
+        self.sidebar.setVisible(not serial_mode)
+        self.log_panel.setVisible(not serial_mode)
+        if not serial_mode:
+            width = max(800, self.splitter_main.width())
+            self.splitter_main.setSizes([270, max(530, width - 270)])
+            self.splitter_vert.setSizes([700, 190])
 
     # ------------------------------------------------------------------ 槽
     def _on_devices(self, devs):
@@ -438,7 +464,7 @@ class MainWindow(QMainWindow):
 
     def _on_device(self, dev):
         if dev is None:
-            self.sb_device.setText("未选择设备")
+            self.sb_device.setText("SSH 目标可用 · 无 ADB" if self.ctx.remote else "未选择设备")
             self.sb_device.setStyleSheet("color:#FFE9A8;padding:2px 10px;")
         else:
             self.sb_device.setText(dev.label())
@@ -460,6 +486,7 @@ class MainWindow(QMainWindow):
             self.sb_mode.setStyleSheet("color:#FFFFFF;padding:2px 10px;")
             self.btn_ssh.setText("  SSH 连接 Ubuntu…")
             self.btn_ssh_exit.setEnabled(False)
+        self._on_device(self.ctx.current)
     def _on_status(self, text: str):
         self.sb_state.setText(text)
 
@@ -470,7 +497,7 @@ class MainWindow(QMainWindow):
 
     def _greet(self):
         exe = self.ctx.adb.exe if self.ctx.adb else "adb"
-        self.ctx.log("ADB 上位机 v%s 启动" % theme.APP_VERSION)
+        self.ctx.log("%s v%s 启动" % (theme.APP_NAME, theme.APP_VERSION))
         self.ctx.log("adb 可执行文件: %s" % exe)
         self.ctx.status("就绪")
 
@@ -586,7 +613,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "关于",
             "%s  v%s\n\n"
-            "ADB 图形化上位机：设备管理、交互终端、数据收发、TCP 通道、\n"
+            "嵌入式设备调试工具，支持设备管理、交互终端、数据收发、串口波形、TCP 通道、\n"
             "双栏文件管理、logcat、截图，支持 SSH 远程驱动 Ubuntu 上的 adb。\n\n"
             "Python %s / PySide6 %s"
             % (theme.APP_NAME, theme.APP_VERSION,

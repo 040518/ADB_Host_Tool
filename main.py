@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ADB 上位机 —— 程序入口。
+"""MUXO+ 的程序入口。
 
 直接运行: python main.py
 打包后:   ADB_Host_Tool.exe
@@ -18,9 +18,10 @@ if _HERE not in sys.path:
 
 def main() -> int:
     import ctypes
+    from ctypes import wintypes
 
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtGui import QFont, QPalette, QColor
+    from PySide6.QtGui import QColor, QCursor, QFont, QPalette
     from PySide6.QtWidgets import QApplication
 
     from ui import theme
@@ -80,22 +81,22 @@ def main() -> int:
 
     ctx = AppContext(settings)
     win = MainWindow(ctx)
+    win.place_on_screen(app.screenAt(QCursor.pos()) or app.primaryScreen())
+    win.show()
 
-    def show_in_foreground():
-        # 每次启动都允许新窗口，但必须恢复并切到前台，避免只出现在任务栏。
-        win.showNormal()
+    def activate_window():
+        if not win.isVisible() or win.isMinimized():
+            return
         win.raise_()
         win.activateWindow()
         if sys.platform.startswith("win"):
             try:
-                hwnd = int(win.winId())
-                ctypes.windll.user32.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                ctypes.windll.user32.SetForegroundWindow(wintypes.HWND(win.winId()))
             except Exception:  # noqa: BLE001
                 pass
 
-    show_in_foreground()
-    QTimer.singleShot(200, show_in_foreground)
+    activate_window()
+    QTimer.singleShot(200, activate_window)
 
     rc = app.exec()
     try:

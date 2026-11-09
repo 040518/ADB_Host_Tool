@@ -111,7 +111,7 @@ class DeviceExplorer(QWidget):
 
         ctx.devices_changed.connect(self._on_devices)
         ctx.device_selected.connect(self._on_device)
-        ctx.remote_changed.connect(lambda _x: self._refresh_mode())
+        ctx.remote_changed.connect(lambda _x: self._on_device(self.ctx.current))
 
     # ---- 槽 ------------------------------------------------------------
     def _goto(self, key: str):
@@ -155,8 +155,8 @@ class DeviceExplorer(QWidget):
 
     def _on_device(self, dev):
         if dev is None:
-            self.lbl_cur.setText("未选择设备")
-            self.lbl_state.setText("状态：—")
+            self.lbl_cur.setText(self.ctx.remote.host if self.ctx.remote else "未选择设备")
+            self.lbl_state.setText("状态：SSH 可用 · ADB 未连接" if self.ctx.remote else "状态：—")
         else:
             self.lbl_cur.setText(dev.model or dev.serial)
             ok = dev.usable

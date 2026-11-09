@@ -162,9 +162,11 @@ def main():
     win._switch_page("files")
     pump(1.2)
     fp = win.pages["files"]
+    fp.pane_local.set_endpoint("ssh")
+    fp.pane_remote.set_endpoint("adb")
     ok = wait(lambda: fp.pane_local.cwd.startswith("/"), 25, "左栏切到 Ubuntu 路径")
     check("左栏路径为 Ubuntu 风格", ok, fp.pane_local.cwd)
-    check("左栏标题显示 Ubuntu", "Ubuntu" in fp.pane_local.lbl_title.text(),
+    check("左栏标题显示 SSH", "SSH" in fp.pane_local.lbl_title.text(),
           fp.pane_local.lbl_title.text())
     check("左栏列出 Ubuntu 目录", fp.pane_local.model.rowCount() > 0,
           str(fp.pane_local.model.rowCount()))
@@ -521,6 +523,7 @@ def main():
     win._switch_page("files")
     pump(1.0)
     fp = win.pages["files"]
+    fp.pane_local.set_endpoint("windows")
     ok = wait(lambda: not fp.pane_local.cwd.startswith("/"), 20, "左栏恢复 Windows 路径")
     check("左栏恢复为 Windows 路径", ok, fp.pane_local.cwd)
     check("左栏标题恢复本机", "Windows" in fp.pane_local.lbl_title.text(),

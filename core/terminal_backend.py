@@ -448,6 +448,8 @@ class RemoteAdbShellSession:
 
     def _cmdline(self):
         """构造在 Ubuntu 的 PTY 里执行的命令：`<adb> -s <serial> shell`。"""
+        if not self.serial:
+            return None   # SSH 目标本机的登录 shell
         adb = self.remote.adb_remote or "adb"
         # 路径本身用双引号包住即可（adb 路径一般不含 $ ` \ 等字符）
         return '"%s" -s "%s" shell' % (adb.replace('"', '\\"'),
@@ -545,6 +547,8 @@ class RemoteAdbShellSession:
         if unchanged:
             return
         self._last_resize = (rows, cols)
+        if not self.serial:
+            return  # 直接 SSH 的 PTY 已 resize，无需向交互 shell 注入 stty
         # 再把尺寸告诉设备端的 pty
         cmd = "stty rows %d cols %d 2>/dev/null" % (self.rows, self.cols)
         delay = 0.6 if initial else 0.15

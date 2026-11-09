@@ -1,25 +1,23 @@
 # -*- coding: utf-8 -*-
-"""文件管理页：左右双栏（本机 / 设备），支持原生拖拽传输。
-
-* 左栏：本地模式 = Windows 文件系统；远程模式 = Ubuntu 文件系统
-* 右栏：设备文件系统（经 adb，本地或 SSH）
-* 拖拽：Qt 原生 DnD，跨栏松开即传输；也支持从系统拖入文件上传
-"""
+"""左右两栏独立选择 Windows / SSH / ADB，支持文件与目录互传。"""
 
 from __future__ import annotations
 
 import os
 import time
+import json
+import uuid
 
 from PySide6.QtCore import (QDir, QMimeData, QModelIndex, QPoint, QSize, Qt, QTimer,
                             QUrl, Signal)
 from PySide6.QtGui import QAction, QDrag, QFont, QIcon, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFileDialog, QHBoxLayout, QHeaderView,
                                QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox,
                                QProgressBar, QPushButton, QSplitter, QToolButton, QTreeView,
                                QVBoxLayout, QWidget)
 
 from core import adb_backend as ab
+from core.file_transfer import endpoint_for, transfer_paths
 from ui import theme
 from ui.context import AppContext
 from ui.widgets import FlatSplitter
@@ -34,6 +32,9 @@ class FilePane(QWidget):
         super().__init__(parent)
         self.ctx = ctx
         self.side = side                 # "local" | "remote"
+        self.endpoint_kind = "windows" if side == "local" else "adb"
+        self._load_generation = 0
+        self._locations = {}
         self.is_local = side == "local"
         self.cwd = os.path.expanduser("~") if self.is_local else "/data/local/tmp"
         self.history = [self.cwd]
@@ -47,6 +48,14 @@ class FilePane(QWidget):
         self.lbl_title = QLabel()
         self.lbl_title.setObjectName("PanelTitle")
         lay.addWidget(self.lbl_title)
+        self.cmb_source = QComboBox()
+        self.cmb_source.addItem("Windows 本机", "windows")
+        self.cmb_source.addItem("Ubuntu / SSH 目标", "ssh")
+        self.cmb_source.addItem("ADB 设备", "adb")
+        self.cmb_source.setCurrentIndex(self.cmb_source.findData(self.endpoint_kind))
+        self.cmb_source.currentIndexChanged.connect(
+            lambda: self.set_endpoint(self.cmb_source.currentData()))
+        lay.addWidget(self.cmb_source)
 
         # ---- 导航 ----
         nav = QHBoxLayout()
@@ -132,12 +141,34 @@ class FilePane(QWidget):
 
     # ---- 标题 / 快捷位置 ------------------------------------------------
     def _remote_mode(self) -> bool:
-        return self.is_local and self.ctx.is_remote
+        return self.endpoint_kind == "ssh"
+
+    def endpoint(self):
+        return endpoint_for(self.ctx, self.endpoint_kind)
+
+    def set_endpoint(self, kind):
+        self._locations[self.endpoint_kind] = (self.cwd, list(self.history), self.hist_idx)
+        self.endpoint_kind = kind
+        self.is_local = kind != "adb"
+        self.cmb_source.blockSignals(True)
+        self.cmb_source.setCurrentIndex(self.cmb_source.findData(kind))
+        self.cmb_source.blockSignals(False)
+        home = (os.path.expanduser("~") if kind == "windows" else
+                ((getattr(self.ctx.remote, "remote_home", "") or "~") if kind == "ssh"
+                 else (self.ctx.cwd or "/data/local/tmp")))
+        self.cwd, self.history, self.hist_idx = self._locations.get(kind, (home, [home], 0))
+        self._load_generation += 1
+        self.ed_path.setText(self.cwd)
+        self._set_rows([])
+        self._update_title()
+        self._fill_quick()
+        self.refresh()
 
     def _update_title(self):
         if self.is_local:
-            if self.ctx.is_remote and self.ctx.remote:
-                self.lbl_title.setText("本机 · Ubuntu (%s)" % self.ctx.remote.host)
+            if self._remote_mode():
+                host = self.ctx.remote.host if self.ctx.remote else "未连接"
+                self.lbl_title.setText("SSH 目标 · %s" % host)
             else:
                 self.lbl_title.setText("本机 · Windows")
             self.model.setHorizontalHeaderLabels(["名称", "大小", "修改时间"])
@@ -149,7 +180,7 @@ class FilePane(QWidget):
     def _places(self):
         if self.is_local:
             if self._remote_mode():
-                home = self.ctx.remote.remote_home or "~"
+                home = getattr(self.ctx.remote, "remote_home", "") or "~"
                 return [("主目录", home), ("/", "/"), ("/tmp", "/tmp"),
                         ("/home", "/home"), ("/opt", "/opt")]
             home = os.path.expanduser("~")
@@ -172,6 +203,7 @@ class FilePane(QWidget):
             it = self.quick_row.takeAt(0)
             w = it.widget()
             if w is not None:
+                w.hide()
                 w.deleteLater()
         for name, path in self._places():
             b = QPushButton(name)
@@ -186,6 +218,7 @@ class FilePane(QWidget):
         path = (path or "").strip()
         if not path:
             return
+        self._load_generation += 1
         if self.is_local:
             if self._remote_mode():
                 self._load_remote_ubuntu(path, push)
@@ -223,13 +256,7 @@ class FilePane(QWidget):
             self._jump(self.history[j])
 
     def _jump(self, path):
-        if self.is_local:
-            if self._remote_mode():
-                self._load_remote_ubuntu(path, push=False)
-            else:
-                self._load_local(path, push=False)
-        else:
-            self._load_device(path, push=False)
+        self.goto(path, push=False)
 
     def _push_history(self, real, push=True):
         self.cwd = real
@@ -241,6 +268,7 @@ class FilePane(QWidget):
     # ---- 加载：本地 ----------------------------------------------------
     def _load_local(self, path, push=True):
         real = os.path.abspath(os.path.expanduser(path))
+        generation = self._load_generation
 
         def work():
             entries = []
@@ -258,6 +286,8 @@ class FilePane(QWidget):
             return real, entries
 
         def done(res, err):
+            if generation != self._load_generation:
+                return
             if err:
                 self.ctx.log("打开本机目录失败 %s: %s" % (real, err), "error")
                 return
@@ -272,7 +302,10 @@ class FilePane(QWidget):
     def _load_remote_ubuntu(self, path, push=True):
         sess = self.ctx.remote
         if sess is None:
+            self._set_rows([])
+            self.lbl_title.setText("SSH 目标 · 请先连接 SSH")
             return
+        generation = self._load_generation
         p = path
         if not (p.startswith("/") or p.startswith("~")):
             p = sess.remote_home or "~"
@@ -283,6 +316,8 @@ class FilePane(QWidget):
             return real, ok, entries, err
 
         def done(res, err):
+            if generation != self._load_generation or self.ctx.remote is not sess:
+                return
             if err:
                 self.ctx.log("打开 Ubuntu 目录失败: %s" % err, "error")
                 return
@@ -304,15 +339,17 @@ class FilePane(QWidget):
             self._set_rows([])
             return
         real = path or "/"
+        generation = self._load_generation
+        endpoint = self.endpoint()
 
         def work():
-            ok, out = self.ctx.adb_ls(real)
-            if not ok:
-                return real, False, [], (out or "").strip()[:300]
+            out = endpoint.command("ls -la %s" % ab.quote(real), timeout=40)
             entries = ab.parse_remote_listing(out)
             return real, True, entries, ""
 
         def done(res, err):
+            if generation != self._load_generation or endpoint.identity != self.endpoint().identity:
+                return
             if err:
                 self.ctx.log("列设备目录失败: %s" % err, "error")
                 return
@@ -377,20 +414,16 @@ class FilePane(QWidget):
         name, is_dir = data
         if is_dir:
             self.goto(self.abs_path(name))
-        elif not self.is_local:
+        else:
             self.view_file()
 
     # ---- 右键菜单 ------------------------------------------------------
     def _menu(self, pos: QPoint):
         m = QMenu(self.tree)
         sel = self.selected_items()
-        if self.is_local:
-            m.addAction("打开", self._open_index_action)
-            m.addSeparator()
-            m.addAction("上传到设备", self.upload_selected)
-        else:
-            m.addAction("打开 / 查看", self.view_file)
-            m.addAction("下载到本机", self.download_selected)
+        m.addAction("打开文件夹", self._open_index_action)
+        m.addAction("查看文本", self.view_file)
+        m.addAction("复制到另一侧", self.upload_selected)
         m.addSeparator()
         m.addAction("新建文件夹", self.mkdir)
         m.addAction("重命名", self.rename)
@@ -420,7 +453,11 @@ class FilePane(QWidget):
             return
         drag = QDrag(self.tree)
         mime = QMimeData()
-        mime.setData(MIME_PANE, ("%s|%s" % (self.side, "\n".join(n for n, _ in sel))).encode("utf-8"))
+        page = self._page()
+        mime.setData(MIME_PANE, json.dumps({
+            "page": page.drag_id if page else "", "side": self.side,
+            "endpoint": list(self.endpoint().identity),
+            "paths": [self.abs_path(n) for n, _ in sel]}, ensure_ascii=False).encode("utf-8"))
         # 若拖到系统资源管理器（仅本地模式有意义）
         if self.is_local and not self._remote_mode():
             mime.setUrls([QUrl.fromLocalFile(self.abs_path(n)) for n, _ in sel])
@@ -434,29 +471,28 @@ class FilePane(QWidget):
             e.ignore()
 
     def _drop(self, e):
-        page = self.window().findChild(FilePage)
+        page = self._page()
         md = e.mimeData()
         if md.hasFormat(MIME_PANE) and page is not None:
-            raw = bytes(md.data(MIME_PANE)).decode("utf-8")
-            src_side, _, names = raw.partition("|")
-            items = [n for n in names.split("\n") if n]
-            if src_side == self.side:
+            try:
+                payload = json.loads(bytes(md.data(MIME_PANE)).decode("utf-8"))
+                src = page.pane_local if payload["side"] == "local" else page.pane_remote
+                valid = (payload["page"] == page.drag_id and src is not self and
+                         payload["endpoint"] == list(src.endpoint().identity))
+            except (ValueError, KeyError, TypeError):
+                valid = False
+            if not valid:
                 e.ignore()
                 return
             e.acceptProposedAction()
-            if src_side == "local":
-                page.upload_items(items, self.cwd)
-            else:
-                page.download_items(items, self.cwd)
+            page.copy_paths(src.endpoint(), self.endpoint(), payload["paths"], self.cwd)
             return
         if md.hasUrls():
             e.acceptProposedAction()
-            if self.is_local:
-                return                       # 拖进本机侧无意义
             # 从系统拖入文件 -> 上传到设备当前目录
             paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
             if page is not None and paths:
-                page.upload_local_paths(paths, self.cwd)
+                page.copy_paths(endpoint_for(self.ctx, "windows"), self.endpoint(), paths, self.cwd)
             return
         e.ignore()
 
@@ -466,26 +502,11 @@ class FilePane(QWidget):
         if not ok or not name.strip():
             return
         name = name.strip()
-        page = self.window().findChild(FilePage)
-        if self.is_local:
-            if self._remote_mode():
-                self.ctx.remote.mkdir(self.abs_path(name))
-                self.refresh()
-            else:
-                try:
-                    os.makedirs(self.abs_path(name), exist_ok=True)
-                except OSError as e:
-                    QMessageBox.critical(self, "新建失败", str(e))
-                self.refresh()
-        else:
-            def work():
-                return self.ctx.adb_shell("mkdir -p %s && echo OK" % ab.quote(self.abs_path(name)))
-
-            def done(res, err):
-                self.ctx.log("新建目录 %s: %s" % (self.abs_path(name), res if not err else err))
-                self.refresh()
-
-            self.ctx.run_async(work, done)
+        if not self._valid_name(name):
+            return
+        endpoint, path = self.endpoint(), self.abs_path(name)
+        self._operation(lambda: endpoint.mkdir(path))
+        return
 
     def rename(self):
         sel = self.selected_items()
@@ -497,21 +518,11 @@ class FilePane(QWidget):
         if not ok or not new.strip() or new == old:
             return
         new = new.strip()
-        if self.is_local:
-            try:
-                os.rename(self.abs_path(old), self.abs_path(new))
-            except OSError as e:
-                QMessageBox.critical(self, "重命名失败", str(e))
-            self.refresh()
-        else:
-            def work():
-                return self.ctx.adb_shell("mv %s %s && echo OK"
-                                          % (ab.quote(self.abs_path(old)), ab.quote(self.abs_path(new))))
-
-            def done(res, err):
-                self.refresh()
-
-            self.ctx.run_async(work, done)
+        if not self._valid_name(new):
+            return
+        endpoint, old_path, new_path = self.endpoint(), self.abs_path(old), self.abs_path(new)
+        self._operation(lambda: endpoint.rename(old_path, new_path))
+        return
 
     def delete(self):
         sel = self.selected_items()
@@ -523,32 +534,9 @@ class FilePane(QWidget):
                                 % (target, len(sel), "\n".join(n for n, _ in sel[:20]))) \
                 != QMessageBox.Yes:
             return
-        if self.is_local:
-            if self._remote_mode():
-                self.ctx.remote.delete([self.abs_path(n) for n, _ in sel])
-                self.refresh()
-                return
-            import shutil
-            for n, is_dir in sel:
-                p = self.abs_path(n)
-                try:
-                    if is_dir:
-                        shutil.rmtree(p)
-                    else:
-                        os.remove(p)
-                except OSError as e:
-                    QMessageBox.critical(self, "删除失败", "%s: %s" % (n, e))
-            self.refresh()
-        else:
-            names = " ".join(ab.quote(self.abs_path(n)) for n, _ in sel)
-
-            def work():
-                return self.ctx.adb_shell("rm -rf %s && echo OK" % names, timeout=120)
-
-            def done(res, err):
-                self.refresh()
-
-            self.ctx.run_async(work, done)
+        endpoint, paths = self.endpoint(), [self.abs_path(n) for n, _ in sel]
+        self._operation(lambda: endpoint.delete(paths))
+        return
 
     def view_file(self):
         sel = self.selected_items()
@@ -556,12 +544,10 @@ class FilePane(QWidget):
             QMessageBox.information(self, "查看", "请选择一个文件")
             return
         path = self.abs_path(sel[0][0])
+        endpoint = self.endpoint()
 
         def work():
-            if self.ctx.remote is not None:
-                rc, out = self.ctx.remote.adb(["shell", "cat %s" % ab.quote(path)], timeout=90)
-                return rc == 0, out.encode("utf-8", "replace"), out
-            return self.ctx.adb.read_file_bytes(path)
+            return True, endpoint.read_bytes(path), ""
 
         def done(res, err):
             if err:
@@ -579,27 +565,49 @@ class FilePane(QWidget):
 
     # ---- 与 FilePage 的转发 --------------------------------------------
     def upload_selected(self):
-        page = self.window().findChild(FilePage)
+        page = self._page()
         if page is not None:
-            page.upload_items([n for n, _ in self.selected_items()], page.pane_remote.cwd)
+            page.copy_selected(self, page.other_pane(self))
 
     def download_selected(self):
-        page = self.window().findChild(FilePage)
-        if page is not None:
-            page.download_items([n for n, _ in self.selected_items()], page.pane_local.cwd)
+        self.upload_selected()
+
+    def _page(self):
+        parent = self.parent()
+        while parent is not None and not isinstance(parent, FilePage):
+            parent = parent.parent()
+        return parent
+
+    def _valid_name(self, name):
+        valid = name not in (".", "..") and not any(c in name for c in ("/", "\\", "\x00"))
+        if not valid:
+            QMessageBox.warning(self, "名称无效", "请输入单个文件或文件夹名称，不包含路径分隔符")
+        return valid
+
+    def _operation(self, fn):
+        def done(_res, err):
+            if err:
+                QMessageBox.warning(self, "文件操作失败", str(err))
+            self.refresh()
+        self.ctx.run_async(fn, done, busy_text="文件操作…")
 
 
 class FilePage(QWidget):
-    """双栏文件管理页。"""
+    """左右两栏可独立选择 Windows、SSH 或 ADB。"""
 
     def __init__(self, ctx: AppContext, parent=None):
         super().__init__(parent)
         self.ctx = ctx
-
+        self.drag_id = uuid.uuid4().hex
+        self._transferring = False
+        self._remote_identity = id(ctx.remote)
+        self._device_identity = ctx.target_identity("adb")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
         lay.setSpacing(6)
-
+        hint = QLabel("左右两栏可分别选择 Windows、Ubuntu / SSH 或 ADB；选中文件后跨栏拖动即可复制。")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
         self.split = FlatSplitter(Qt.Horizontal)
         self.split.setChildrenCollapsible(False)
         self.pane_local = FilePane(ctx, "local")
@@ -608,274 +616,136 @@ class FilePage(QWidget):
         self.split.addWidget(self.pane_remote)
         self.split.setSizes([560, 560])
         lay.addWidget(self.split, 1)
-
-        # 中间工具栏
         bar = QHBoxLayout()
-        bar.setSpacing(6)
-        lbl = QLabel("拖拽文件/文件夹到另一侧即可传输，或使用按钮：")
-        lbl.setStyleSheet("color:%s;" % theme.COLORS["text_dim"])
-        bar.addWidget(lbl)
-
-        b_up = QPushButton("上传 →")
-        b_up.setIcon(theme.load_icon("up"))
-        b_up.clicked.connect(self._upload_clicked)
-        bar.addWidget(b_up)
-
-        b_down = QPushButton("← 下载")
-        b_down.setIcon(theme.load_icon("down"))
-        b_down.clicked.connect(self._download_clicked)
-        bar.addWidget(b_down)
-
-        b_updir = QPushButton("上传文件夹 →")
-        b_updir.setObjectName("Secondary")
-        b_updir.clicked.connect(self._upload_dir_clicked)
-        bar.addWidget(b_updir)
-
+        self.btn_right = QPushButton("复制到右侧 →")
+        self.btn_right.clicked.connect(self._upload_clicked)
+        bar.addWidget(self.btn_right)
+        self.btn_left = QPushButton("← 复制到左侧")
+        self.btn_left.clicked.connect(self._download_clicked)
+        bar.addWidget(self.btn_left)
+        self.btn_import = QPushButton("从 Windows 选择文件…")
+        self.btn_import.clicked.connect(self._import_files)
+        bar.addWidget(self.btn_import)
+        self.btn_import_dir = QPushButton("选择文件夹…")
+        self.btn_import_dir.clicked.connect(self._upload_dir_clicked)
+        bar.addWidget(self.btn_import_dir)
         bar.addStretch(1)
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(220)
+        self.progress.setMaximumWidth(180)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setTextVisible(True)
         bar.addWidget(self.progress)
-
         self.lbl_task = QLabel("")
-        self.lbl_task.setStyleSheet("color:%s;" % theme.COLORS["text_dim"])
-        self.lbl_task.setMinimumWidth(120)
         bar.addWidget(self.lbl_task)
         lay.addLayout(bar)
-
         ctx.device_selected.connect(lambda _d: self.refresh_remote())
         ctx.remote_changed.connect(lambda _x: self.on_remote_changed())
-
+        if ctx.remote is not None and ctx.current is None:
+            self.pane_remote.set_endpoint("ssh")
         self.on_remote_changed()
 
-    # ---- 外部通知 ------------------------------------------------------
+    def other_pane(self, pane):
+        return self.pane_remote if pane is self.pane_local else self.pane_local
+
     def on_remote_changed(self):
-        self.pane_local._fill_quick()
-        self.pane_local._update_title()
-        self.pane_remote._update_title()
-        if self.ctx.is_remote and self.ctx.remote:
-            home = self.ctx.remote.remote_home or "~"
-            self.pane_local.history = [home]
-            self.pane_local.hist_idx = 0
-            self.pane_local.goto(home)
-            self.refresh_remote()
-        else:
-            home = os.path.expanduser("~")
-            self.pane_local.history = [home]
-            self.pane_local.hist_idx = 0
-            self.pane_local.goto(home)
-            self.refresh_remote()
+        changed = self._remote_identity != id(self.ctx.remote)
+        self._remote_identity = id(self.ctx.remote)
+        for pane in (self.pane_local, self.pane_remote):
+            if changed:
+                pane._locations.pop("ssh", None)
+                if pane.endpoint_kind == "ssh":
+                    pane.cwd = getattr(self.ctx.remote, "remote_home", "") or "~"
+                    pane.history, pane.hist_idx = [pane.cwd], 0
+            pane._update_title()
+            pane._fill_quick()
+            pane.refresh()
+        if self.ctx.remote is not None and self.ctx.current is None and self.pane_remote.endpoint_kind == "adb":
+            self.pane_remote.set_endpoint("ssh")
 
     def refresh_remote(self):
-        self.pane_remote._update_title()
-        if self.ctx.current is None:
-            self.pane_remote._set_rows([])
+        # ADB 自动刷新不应打断 Windows/SSH 目录浏览或使异步结果失效。
+        identity = self.ctx.target_identity("adb")
+        if identity == self._device_identity:
             return
-        self.pane_remote.goto(self.ctx.cwd or "/data/local/tmp", push=False)
+        self._device_identity = identity
+        for pane in (self.pane_local, self.pane_remote):
+            if pane.endpoint_kind == "adb":
+                pane._update_title()
+                pane.refresh()
 
-    # ---- 按钮 ----------------------------------------------------------
-    def _upload_clicked(self):
-        sel = self.pane_local.selected_items()
-        if not sel:
-            QMessageBox.information(self, "上传", "请先在左侧选择要上传的文件或文件夹")
+    def copy_selected(self, source, destination):
+        paths = [source.abs_path(n) for n, _ in source.selected_items()]
+        if not paths:
+            QMessageBox.information(self, "传输", "请先选择要复制的文件或文件夹")
             return
-        self.upload_items([n for n, _ in sel], self.pane_remote.cwd)
+        self.copy_paths(source.endpoint(), destination.endpoint(), paths, destination.cwd)
+
+    def _upload_clicked(self):
+        self.copy_selected(self.pane_local, self.pane_remote)
 
     def _download_clicked(self):
-        sel = self.pane_remote.selected_items()
-        if not sel:
-            QMessageBox.information(self, "下载", "请先在右侧选择要下载的文件")
-            return
-        self.download_items([n for n, _ in sel], self.pane_local.cwd)
+        self.copy_selected(self.pane_remote, self.pane_local)
+
+    def _import_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择 Windows 文件，复制到右侧")
+        if paths:
+            self.upload_local_paths(paths, self.pane_remote.cwd)
 
     def _upload_dir_clicked(self):
-        d = QFileDialog.getExistingDirectory(self, "选择要上传的文件夹")
-        if d:
-            self.upload_local_paths([d], self.pane_remote.cwd)
+        path = QFileDialog.getExistingDirectory(self, "选择 Windows 文件夹，复制到右侧")
+        if path:
+            self.upload_local_paths([path], self.pane_remote.cwd)
 
-    # ---- 传输实现 ------------------------------------------------------
-    def _set_progress(self, val: int, text: str = ""):
-        self.progress.setValue(max(0, min(100, val)))
-        if text:
-            self.lbl_task.setText(text)
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents()
+    def _set_progress(self, value, text=""):
+        self.progress.setRange(0, 100)
+        self.progress.setValue(value)
+        self.lbl_task.setText(text)
 
+    def copy_paths(self, source, destination, paths, destination_dir):
+        if self._transferring:
+            self.ctx.log("当前传输尚未完成，请稍后再试", "warn")
+            return
+        try:
+            source.require()
+            destination.require()
+        except Exception as exc:
+            QMessageBox.warning(self, "传输", str(exc))
+            return
+        self._transferring = True
+        for button in (self.btn_left, self.btn_right, self.btn_import, self.btn_import_dir):
+            button.setEnabled(False)
+        self.progress.setRange(0, 0)
+        self.lbl_task.setText("正在复制…")
+        self.ctx.log("文件传输 %s → %s：%s" % (source.kind, destination.kind, destination_dir))
+        frozen_paths = list(paths)
+
+        def work():
+            return transfer_paths(source, destination, frozen_paths, destination_dir)
+
+        def done(names, err):
+            self._transferring = False
+            for button in (self.btn_left, self.btn_right, self.btn_import, self.btn_import_dir):
+                button.setEnabled(True)
+            self._set_progress(0 if err else 100, "传输失败" if err else "完成 %d 项" % len(names))
+            if err:
+                self.ctx.log("文件传输失败：%s" % err, "error")
+                QMessageBox.warning(self, "传输失败", str(err))
+            else:
+                self.ctx.log("文件传输完成：%s" % ", ".join(names), "ok")
+            for pane in (self.pane_local, self.pane_remote):
+                if pane.endpoint().identity == destination.identity:
+                    pane.refresh()
+
+        self.ctx.run_async(work, done)
+
+    # 保留外部调用入口，目标始终取对应栏当前选择的文件系统。
     def upload_local_paths(self, paths, dest_dir):
-        """从系统路径上传（仅本地模式，或远程模式经 SFTP 中转）。"""
-        if self.ctx.current is None:
-            QMessageBox.warning(self, "上传", "请先连接设备")
-            return
-        if self.ctx.is_remote:
-            self._upload_via_sftp(paths, dest_dir)
-            return
-
-        names = ", ".join(os.path.basename(p) for p in paths)
-        self.ctx.log("上传 %s -> %s" % (names, dest_dir))
-
-        def work():
-            proc = self.ctx.adb.popen(["push"] + list(paths) + [dest_dir])
-            last = []
-            buf = b""
-            try:
-                while True:
-                    chunk = proc.stdout.read(512) if proc.stdout else b""
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while b"\r" in buf or b"\n" in buf:
-                        sep = b"\r" if b"\r" in buf else b"\n"
-                        line, buf = buf.split(sep, 1)
-                        text = line.decode("utf-8", "replace")
-                        pr = ab.parse_progress(text)
-                        if pr:
-                            last.append(text)
-            finally:
-                proc.wait()
-            return proc.returncode, "\n".join(last[-5:])
-
-        def done(res, err):
-            if err:
-                QMessageBox.critical(self, "上传失败", str(err))
-                self._set_progress(0)
-                return
-            rc, out = res
-            self._set_progress(100 if rc == 0 else 0, "上传完成" if rc == 0 else "上传失败")
-            self.ctx.log("上传完成 rc=%s" % rc, "ok" if rc == 0 else "error")
-            self.refresh_remote()
-            if rc != 0:
-                QMessageBox.critical(self, "上传失败", out[-1200:])
-
-        self._set_progress(0, "上传中…")
-        self.ctx.run_async(work, done)
-
-    def _upload_via_sftp(self, paths, dest_dir):
-        sess = self.ctx.remote
-
-        def work():
-            stage = "/tmp/adbhost_stage_%d" % int(time.time() * 1000)
-            sess.exec("mkdir -p %s" % stage, timeout=20)
-            for p in paths:
-                ok, msg = sess.upload_file(p, stage)
-                if not ok:
-                    sess.exec("rm -rf %s" % stage)
-                    return False, msg
-            rc, out = sess.adb(["push"] + [stage + "/" + os.path.basename(p.rstrip("/\\"))
-                                           for p in paths] + [dest_dir], timeout=1800)
-            sess.exec("rm -rf %s" % stage, timeout=20)
-            return rc == 0, out
-
-        def done(res, err):
-            if err:
-                QMessageBox.critical(self, "上传失败", str(err))
-                return
-            ok, out = res
-            self._set_progress(100 if ok else 0, "上传完成" if ok else "上传失败")
-            self.ctx.log("上传(经 SSH) %s" % ("成功" if ok else "失败: " + (out or "")[-300:]),
-                         "ok" if ok else "error")
-            self.refresh_remote()
-
-        self._set_progress(0, "上传中…")
-        self.ctx.run_async(work, done)
+        self.copy_paths(endpoint_for(self.ctx, "windows"), self.pane_remote.endpoint(), paths, dest_dir)
 
     def upload_items(self, names, dest_dir):
-        """左侧栏里的项目 -> 设备。"""
-        if not names:
-            return
-        if self.ctx.current is None:
-            QMessageBox.warning(self, "上传", "请先连接设备")
-            return
-        if self.ctx.is_remote:
-            # 远程模式：左侧就是 Ubuntu 路径，直接在远端 adb push
-            paths = [self.pane_local.abs_path(n) for n in names]
-            sess = self.ctx.remote
-
-            def work():
-                return sess.adb(["push"] + paths + [dest_dir], timeout=1800)
-
-            def done(res, err):
-                if err:
-                    QMessageBox.critical(self, "上传失败", str(err))
-                    return
-                rc, out = res
-                self._set_progress(100 if rc == 0 else 0, "上传完成" if rc == 0 else "上传失败")
-                self.ctx.log("上传(经 SSH) %s -> %s %s"
-                             % (", ".join(names), dest_dir, "成功" if rc == 0 else "失败"),
-                             "ok" if rc == 0 else "error")
-                self.refresh_remote()
-
-            self._set_progress(0, "上传中…")
-            self.ctx.run_async(work, done)
-            return
-        self.upload_local_paths([self.pane_local.abs_path(n) for n in names], dest_dir)
+        self.copy_paths(self.pane_local.endpoint(), self.pane_remote.endpoint(),
+                        [self.pane_local.abs_path(n) for n in names], dest_dir)
 
     def download_items(self, names, dest_dir):
-        """设备 -> 左侧栏目录。"""
-        if not names:
-            return
-        if self.ctx.current is None:
-            return
-        remotes = [self.pane_remote.abs_path(n) for n in names]
-        sess = self.ctx.remote
-
-        if sess is not None:
-            def work():
-                stage = "/tmp/adbhost_stage_%d" % int(time.time() * 1000)
-                sess.exec("mkdir -p %s" % stage, timeout=20)
-                rc, out = sess.adb(["pull"] + remotes + [stage], timeout=1800)
-                if rc != 0:
-                    sess.exec("rm -rf %s" % stage, timeout=20)
-                    return False, out
-                q = " ".join(ab.quote(stage + "/" + os.path.basename(r.rstrip("/"))) for r in remotes)
-                cprc, cpout = sess.exec("cp -a %s %s/ && echo OK" % (q, ab.quote(dest_dir)),
-                                        timeout=600)
-                sess.exec("rm -rf %s" % stage, timeout=20)
-                return (cprc == 0 and "OK" in (cpout or "")), (out + cpout)
-
-            def done(res, err):
-                if err:
-                    QMessageBox.critical(self, "下载失败", str(err))
-                    return
-                ok, out = res
-                self._set_progress(100 if ok else 0, "下载完成" if ok else "下载失败")
-                self.ctx.log("下载(经 SSH) %s %s" % (", ".join(names), "成功" if ok else "失败"),
-                             "ok" if ok else "error")
-                self.refresh_remote()
-                if self.pane_local.cwd:
-                    self.pane_local.refresh()
-
-            self._set_progress(0, "下载中…")
-            self.ctx.run_async(work, done)
-            return
-
-        # 本地模式：adb pull 到 Windows 目录
-        def work():
-            proc = self.ctx.adb.popen(["pull"] + remotes + [dest_dir])
-            buf = b""
-            try:
-                while True:
-                    chunk = proc.stdout.read(512) if proc.stdout else b""
-                    if not chunk:
-                        break
-                    buf += chunk
-            finally:
-                proc.wait()
-            return proc.returncode, buf.decode("utf-8", "replace")
-
-        def done(res, err):
-            if err:
-                QMessageBox.critical(self, "下载失败", str(err))
-                return
-            rc, out = res
-            self._set_progress(100 if rc == 0 else 0, "下载完成" if rc == 0 else "下载失败")
-            self.ctx.log("下载 %s -> %s %s"
-                         % (", ".join(names), dest_dir, "成功" if rc == 0 else "失败"),
-                         "ok" if rc == 0 else "error")
-            self.pane_local.refresh()
-            if rc != 0:
-                QMessageBox.critical(self, "下载失败", out[-1200:])
-
-        self._set_progress(0, "下载中…")
-        self.ctx.run_async(work, done)
+        self.copy_paths(self.pane_remote.endpoint(), self.pane_local.endpoint(),
+                        [self.pane_remote.abs_path(n) for n in names], dest_dir)

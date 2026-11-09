@@ -11,9 +11,9 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QPixmap, QPainter
 from PySide6.QtSvg import QSvgRenderer
 
-APP_NAME = "ADB 上位机"
+APP_NAME = "MUXO+"
 APP_ID = "ADB_Host_Tool"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.3.7"
 WINDOWS_APP_ID = "ADBHostTool.Desktop.v2"
 
 # ---------------------------------------------------------------------------
@@ -114,6 +114,7 @@ DEFAULT_SETTINGS = {
     "log_autoscroll": True,
     "terminal_type": "xterm-256color",
     "camera_rotation": -90,      # RK3568 当前摄像头模组横装，预览默认向左校正
+    "camera_rotation_ssh": 0,    # SSH 摄像头方向独立保存
     "last_page": 0,
     "restore_layout": True,
     "language": "zh",
